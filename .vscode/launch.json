@@ -1,0 +1,30 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch Server",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/server/main.go",
+            "args": [
+                "-buffer-ms", "10",
+                "-rate", "48000"
+            ],
+            "env": {},
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "name": "Launch Client",
+            "type": "go",
+            "request": "launch",
+            "mode": "auto",
+            "program": "${workspaceFolder}/cmd/client/main.go",
+            "args": [
+                "-server", "localhost:50051"
+            ],
+            "env": {},
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}

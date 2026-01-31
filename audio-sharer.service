@@ -1,0 +1,14 @@
+[Unit]
+Description=Go gRPC Audio Sharer Service
+After=network.target sound.target pulseaudio.service
+
+[Service]
+Type=simple
+ExecStart=/home/random/src/go-audio-sharer/audio_server -port 5001
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
