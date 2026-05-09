@@ -34,9 +34,7 @@ type AudioWriter struct {
 }
 
 func (w *AudioWriter) Write(p []byte) (int, error) {
-	data := make([]byte, len(p))
-	copy(data, p)
-	w.callback(data)
+	w.callback(p)
 	return len(p), nil
 }
 
@@ -97,10 +95,9 @@ func (r *Recorder) Unsubscribe(ch chan CapturedBlock) {
 
 func (r *Recorder) startRecording() {
 	var opts []pulse.RecordOption
+	found := false
 
-	// 1. Device Selection
 	if r.config.Device != "" {
-		// Try to find a sink (for loopback) matching the name
 		sinks, err := r.client.ListSinks()
 		if err == nil {
 			for _, s := range sinks {
@@ -108,12 +105,13 @@ func (r *Recorder) startRecording() {
 					strings.Contains(strings.ToLower(s.ID()), strings.ToLower(r.config.Device)) {
 					fmt.Printf("Selected Sink Monitor: %s (%s)\n", s.Name(), s.ID())
 					opts = append(opts, pulse.RecordMonitor(s))
-					goto DeviceFound
+					found = true
+					break
 				}
 			}
 		}
 
-		// Try to find a source matching the name
+		if !found {
 		sources, err := r.client.ListSources()
 		if err == nil {
 			for _, s := range sources {
@@ -121,11 +119,16 @@ func (r *Recorder) startRecording() {
 					strings.Contains(strings.ToLower(s.ID()), strings.ToLower(r.config.Device)) {
 					fmt.Printf("Selected Source: %s (%s)\n", s.Name(), s.ID())
 					opts = append(opts, pulse.RecordSource(s))
-					goto DeviceFound
+						found = true
+						break
+					}
 				}
 			}
 		}
+
+		if !found {
 		fmt.Printf("Warning: Device '%s' not found, using default.\n", r.config.Device)
+	}
 	}
 
 	if len(opts) == 0 {
@@ -138,8 +141,6 @@ func (r *Recorder) startRecording() {
 		opts = append(opts, pulse.RecordMonitor(sink))
 	}
 
-DeviceFound:
-	// 2. Audio Format
 	opts = append(opts, pulse.RecordSampleRate(r.config.SampleRate))
 	switch r.config.Channels {
 	case 2:
@@ -147,12 +148,9 @@ DeviceFound:
 	case 1:
 		opts = append(opts, pulse.RecordMono)
 	default:
-		// Fallback for custom channels if needed, but simple Stereo/Mono covers most
 		opts = append(opts, pulse.RecordStereo)
 	}
 
-	// 3. Buffer Size Calculation
-	// Bytes = (SampleRate * Channels * Bits/8) * (Ms / 1000)
 	bytesPerSample := r.config.BitsPerSample / 8
 	frameSize := r.config.Channels * bytesPerSample
 	bufferBytes := (r.config.SampleRate * frameSize * r.config.BufferMs) / 1000

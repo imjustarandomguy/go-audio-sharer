@@ -54,7 +54,7 @@ func main() {
 	cfg := audio.Config{
 		SampleRate:    int(fmtInfo.SampleRate),
 		Channels:      int(fmtInfo.Channels),
-		BitsPerSample: 16,
+		BitsPerSample: int(fmtInfo.BitsPerSample),
 		BufferMs:      *latencyMs,
 		Device:        *device,
 	}
@@ -74,13 +74,17 @@ func main() {
 				return
 			}
 			if err != nil {
-				if ctx.Err() == nil {
+				if ctx.Err() != nil {
+					log.Printf("Stream cancelled: %v", ctx.Err())
+				} else {
 					log.Printf("Failed to receive: %v", err)
 				}
 				return
 			}
 			if err := player.Write(in.Data); err != nil {
-				if ctx.Err() == nil {
+				if ctx.Err() != nil {
+					log.Printf("Write cancelled: %v", ctx.Err())
+				} else {
 					log.Printf("Failed to write to playback: %v", err)
 				}
 				return
