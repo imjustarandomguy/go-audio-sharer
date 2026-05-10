@@ -6,16 +6,22 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"go-audio-sharer/internal/audio"
-	// Import the generated proto code.
-	// The directory is 'proto', and the package declared inside is now 'proto'
 	pb "go-audio-sharer/proto"
 )
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true
+	},
+}
 
 type server struct {
 	pb.UnimplementedAudioStreamServer
@@ -58,6 +64,43 @@ func (s *server) GetFormat(_ context.Context, _ *emptypb.Empty) (*pb.AudioFormat
 	}, nil
 }
 
+func wsStreamAudio(recorder *audio.Recorder, config audio.Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("WebSocket upgrade error: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		conn.SetCloseHandler(func(code int, text string) error {
+			log.Printf("WebSocket closed by client: %d %s", code, text)
+			return nil
+		})
+
+		log.Println("WebSocket client connected")
+		ch := recorder.Subscribe()
+		defer recorder.Unsubscribe(ch)
+
+		if err := conn.WriteJSON(map[string]interface{}{
+			"sampleRate":    config.SampleRate,
+			"channels":      config.Channels,
+			"bitsPerSample": config.BitsPerSample,
+		}); err != nil {
+			log.Printf("WebSocket write format error: %v", err)
+			return
+		}
+
+		for block := range ch {
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteMessage(websocket.BinaryMessage, block.Data); err != nil {
+				log.Printf("WebSocket write error: %v", err)
+				return
+			}
+		}
+	}
+}
+
 func main() {
 	port := flag.String("port", "50051", "Port to listen on")
 	bufferMs := flag.Int("buffer-ms", 10, "Buffer size in milliseconds")
@@ -94,7 +137,19 @@ func main() {
 		config:   config,
 	})
 
-	log.Printf("Server listening on %v", lis.Addr())
+	go func() {
+		httpMux := http.NewServeMux()
+		httpMux.HandleFunc("/ws", wsStreamAudio(recorder, config))
+		httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			http.ServeFile(w, r, "web/index.html")
+		})
+		log.Printf("HTTP/WebSocket server listening on :8080")
+		if err := http.ListenAndServe(":8080", httpMux); err != nil {
+			log.Fatalf("HTTP server failed: %v", err)
+		}
+	}()
+
+	log.Printf("gRPC server listening on %v", lis.Addr())
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}

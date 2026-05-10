@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Audio Sharer</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  background: #1a1a2e;
+  color: #e0e0e0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  gap: 20px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  margin: 0;
+  padding: 24px;
+}
+h1 {
+  color: #00d9ff;
+  font-weight: 300;
+  font-size: 1.6rem;
+  letter-spacing: 1px;
+  margin: 0;
+}
+.card {
+  background: #16213e;
+  border-radius: 12px;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 20px;
+  min-width: 280px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+}
+#connectBtn {
+  background: #00d9ff;
+  color: #1a1a2e;
+  border: none;
+  padding: 12px 36px;
+  border-radius: 8px;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+}
+#connectBtn:hover { background: #33e3ff; }
+#connectBtn:active { transform: scale(0.97); }
+.status {
+  font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+  font-size: 0.85rem;
+  color: #888;
+  text-align: center;
+  margin: 0;
+  transition: color 0.3s;
+}
+.status.connected { color: #4ade80; }
+.status.error { color: #ff6b6b; }
+#deviceLabel {
+  font-size: 0.75rem;
+  color: #666;
+  cursor: pointer;
+  margin: 0;
+}
+#deviceLabel:hover { color: #00d9ff; }
+#deviceLabel:empty { display: none; }
+</style>
+</head>
+<body>
+<h1>Audio Sharer</h1>
+<div class="card">
+  <button id="connectBtn">Connect</button>
+  <div id="status" class="status">Disconnected</div>
+  <div id="deviceLabel"></div>
+</div>
+
+<script>
+let ws = null;
+let ctx = null;
+let node = null;
+let sinkId = '';
+let audioEl = null;
+let processorRegistered = false;
+
+const btn = document.getElementById('connectBtn');
+const statusEl = document.getElementById('status');
+const deviceLabel = document.getElementById('deviceLabel');
+
+function setStatus(text, type) {
+  statusEl.textContent = text;
+  statusEl.className = 'status' + (type ? ' ' + type : '');
+}
+
+function cleanup() {
+  if (node) { try { node.disconnect(); } catch(e) {} node = null; }
+  if (audioEl) {
+    try { audioEl.pause(); audioEl.srcObject = null; } catch(e) {}
+    audioEl = null;
+  }
+  if (ctx) { try { ctx.close(); } catch(e) {} ctx = null; }
+  processorRegistered = false;
+}
+
+function disconnectWebSocket() {
+  if (ws) {
+    ws.onclose = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.close();
+    ws = null;
+  }
+}
+
+function fullyDisconnect() {
+  disconnectWebSocket();
+  cleanup();
+  btn.textContent = 'Connect';
+  btn.className = '';
+  setStatus('Disconnected');
+}
+
+btn.onclick = async function() {
+  if (ws) {
+    fullyDisconnect();
+    return;
+  }
+
+  ctx = new AudioContext();
+  audioEl = new Audio();
+  audioEl.autoplay = true;
+
+  if (!sinkId && navigator.mediaDevices?.selectAudioOutput) {
+    try {
+      const device = await navigator.mediaDevices.selectAudioOutput();
+      sinkId = device.deviceId;
+      deviceLabel.textContent = 'Output: ' + device.label;
+    } catch (e) {
+      deviceLabel.textContent = 'Output: default';
+    }
+  }
+
+  if (sinkId && audioEl.setSinkId) {
+    try {
+      await audioEl.setSinkId(sinkId);
+    } catch (e) { /* ignore */ }
+  }
+
+  if (sinkId && !deviceLabel.textContent) {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const d = devices.find(x => x.deviceId === sinkId);
+      deviceLabel.textContent = 'Output: ' + (d ? d.label : sinkId.slice(0, 12));
+    } catch(e) { /* ignore */ }
+  }
+
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = function() {
+    btn.textContent = 'Disconnect';
+    btn.className = '';
+    setStatus('Waiting for audio...');
+  };
+
+  ws.onmessage = async function(e) {
+    if (e.data instanceof ArrayBuffer) {
+      if (node) node.port.postMessage(e.data);
+      return;
+    }
+
+    try {
+      const fmt = JSON.parse(e.data);
+      setStatus(fmt.sampleRate + ' Hz \u00b7 ' + fmt.channels + ' ch', 'connected');
+
+      if (processorRegistered) {
+        node = new AudioWorkletNode(ctx, 'audio-sharer-processor', {
+          outputChannelCount: [fmt.channels]
+        });
+        const dest = ctx.createMediaStreamDestination();
+        node.connect(dest);
+        audioEl.srcObject = dest.stream;
+        audioEl.play().catch(function(e) { console.log('play error:', e); });
+        return;
+      }
+
+      const code = [
+        'class P extends AudioWorkletProcessor {',
+        '  constructor() {',
+        '    super();',
+        '    this.q = [];',
+        '    this.port.onmessage = (e) => this.q.push(new Int16Array(e.data));',
+        '  }',
+        '  process(inputs, outputs) {',
+        '    const out = outputs[0];',
+        '    const ch = out.length;',
+        '    const n = out[0].length;',
+        '    if (this.q.length === 0) return true;',
+        '    let fill = 0;',
+        '    while (this.q.length > 0 && fill < n) {',
+        '      const src = this.q[0];',
+        '      const frames = Math.floor(src.length / ch);',
+        '      const need = n - fill;',
+        '      const take = Math.min(need, frames);',
+        '      for (let c = 0; c < ch; c++) {',
+        '        const chOut = out[c];',
+        '        for (let i = 0; i < take; i++) {',
+        '          chOut[fill + i] = src[i * ch + c] / 32768;',
+        '        }',
+        '      }',
+        '      if (take < frames) {',
+        '        this.q[0] = src.slice(take * ch);',
+        '      } else {',
+        '        this.q.shift();',
+        '      }',
+        '      fill += take;',
+        '    }',
+        '    return true;',
+        '  }',
+        '}',
+        'registerProcessor("audio-sharer-processor", P);'
+      ].join('\n');
+
+      const blob = new Blob([code], { type: 'application/javascript' });
+      await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
+      processorRegistered = true;
+
+      node = new AudioWorkletNode(ctx, 'audio-sharer-processor', {
+        outputChannelCount: [fmt.channels]
+      });
+      const dest = ctx.createMediaStreamDestination();
+      node.connect(dest);
+      audioEl.srcObject = dest.stream;
+      audioEl.play().catch(function(e) { console.log('play error:', e); });
+    } catch (e) {
+      console.log('Error processing message:', e);
+      setStatus('Error: ' + e.message, 'error');
+    }
+  };
+
+  ws.onclose = function() {
+    fullyDisconnect();
+  };
+
+  ws.onerror = function() {
+    setStatus('Connection error', 'error');
+  };
+};
+
+deviceLabel.onclick = async function() {
+  if (!navigator.mediaDevices?.selectAudioOutput) return;
+  try {
+    const device = await navigator.mediaDevices.selectAudioOutput();
+    sinkId = device.deviceId;
+    deviceLabel.textContent = 'Output: ' + device.label;
+    if (audioEl && audioEl.setSinkId) {
+      await audioEl.setSinkId(sinkId);
+    }
+  } catch(e) { /* ignore */ }
+};
+
+window.addEventListener('beforeunload', function() {
+  if (ws) {
+    ws.onclose = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.close();
+    ws = null;
+  }
+  cleanup();
+});
+</script>
+</body>
+</html>
