@@ -234,7 +234,9 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	shutdown := func() {
-		grpcServer.GracefulStop()
+		// Use Stop(), not GracefulStop(): GracefulStop waits for active streaming
+		// RPCs (GetStream), which never end while a client stays connected.
+		grpcServer.Stop()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(ctx)
