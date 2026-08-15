@@ -95,6 +95,16 @@ Headless systemd mode is still supported with `-no-tray` (see `audio-sharer.serv
 
 The client is a tray application. It connects automatically on launch (unless disabled in config).
 
+It also accepts CLI flags which override the config for that run (useful for testing):
+
+```bash
+./audio_client \
+  -server 10.0.0.220:5001 \  # override the server address
+  -device "Arctis Nova 7" \   # override the output device
+  -latency 20 \               # override latency in ms
+  -no-tray                    # run headless: print status to the terminal (no tray icon)
+```
+
 Right-click the tray icon for:
 - **Start** / **Stop** / **Restart** / **Exit**,
 - **Network Interface**: pick the LAN interface (e.g. `Ethernet`/`Wi-Fi`) to route around your VPN,

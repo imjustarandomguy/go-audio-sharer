@@ -1,14 +1,17 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sync"
+	"syscall"
 	"time"
 
 	"fyne.io/systray"
@@ -52,16 +55,39 @@ func main() {
 		defer f.Close()
 	}
 
+	server := flag.String("server", "", "Server address override (host:port); overrides the config file for this run")
+	device := flag.String("device", "", "Audio output device override (substring match)")
+	latency := flag.Int("latency", 0, "Playback latency override in ms (0 = use config)")
+	autoConnect := flag.Bool("autoconnect", true, "Connect automatically on launch")
+	noTray := flag.Bool("no-tray", false, "Run headless without a tray icon; print status to the terminal")
+	flag.Parse()
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("could not load config: %v", err)
 	}
+	if *server != "" {
+		cfg.Server = *server
+	}
+	if *device != "" {
+		cfg.Device = *device
+	}
+	if *latency != 0 {
+		cfg.LatencyMs = *latency
+	}
+	cfg.AutoConnect = *autoConnect && cfg.AutoConnect
 
 	if devs, err := audio.ListPlaybackDeviceDescriptions(); err == nil {
 		devState.devs = devs
 	}
 
 	app := client.New(cfg)
+
+	if *noTray {
+		runHeadless(app, *autoConnect)
+		return
+	}
+
 	if cfg.AutoConnect {
 		app.Start()
 	}
@@ -289,6 +315,22 @@ func sameDevices(a, b []audio.DeviceDesc) bool {
 		}
 	}
 	return true
+}
+
+// runHeadless runs the client without a tray icon, printing status to the
+// terminal and exiting on SIGINT/SIGTERM. Useful for testing and scripting.
+func runHeadless(app *client.App, autoConnect bool) {
+	if autoConnect {
+		app.Start()
+	}
+	app.SetStatusCallback(func() {
+		fmt.Printf("[client] %s\n", app.Status())
+	})
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	app.Stop()
 }
 
 // setupLog mirrors output to a log file in the config directory. This matters
