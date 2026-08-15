@@ -1,122 +1,92 @@
 package audio
 
 import (
-	"fmt"
 	"io"
-	"strings"
 	"sync"
+	"time"
 
-	"github.com/jfreymuth/pulse"
-	"github.com/jfreymuth/pulse/proto"
+	"github.com/ebitengine/oto/v3"
 )
 
+// Player streams raw PCM to the system's default audio output via Oto.
+// Only one Oto context may exist per process; create it with NewAudioContext
+// once, then create players with NewPlayer.
 type Player struct {
-	pulseClient   *pulse.Client
-	playStream    *pulse.PlaybackStream
-	pipeReader    *io.PipeReader
-	pipeWriter    *io.PipeWriter
-	deviceMonitor *DeviceMonitor
-	mu            sync.Mutex
-
-	config   Config
-	isPlaying bool
-	restartCh chan struct{}
+	ctx        *oto.Context
+	player     *oto.Player
+	pipeReader *io.PipeReader
+	pipeWriter *io.PipeWriter
+	mu         sync.Mutex
+	config     Config
+	volume     float64
+	isPlaying  bool
 }
 
-func NewPlayer(cfg Config) (*Player, error) {
-	pulseClient, err := pulse.NewClient()
-	if err != nil {
-		return nil, fmt.Errorf("could not create pulse client: %w", err)
+// NewAudioContext creates the single Oto context for the process. The returned
+// channel is closed once the audio device is ready.
+func NewAudioContext(cfg Config) (*oto.Context, chan struct{}, error) {
+	format := oto.FormatSignedInt16LE
+	switch cfg.BitsPerSample {
+	case 8:
+		format = oto.FormatUnsignedInt8
+	case 32:
+		format = oto.FormatFloat32LE
 	}
 
+	op := &oto.NewContextOptions{
+		SampleRate:   cfg.SampleRate,
+		ChannelCount: cfg.Channels,
+		Format:       format,
+		BufferSize:   time.Duration(cfg.BufferMs) * time.Millisecond,
+	}
+
+	return oto.NewContext(op)
+}
+
+func NewPlayer(otoCtx *oto.Context, cfg Config) (*Player, error) {
 	pr, pw := io.Pipe()
-
-	p := &Player{
-		pulseClient: pulseClient,
-		pipeReader:  pr,
-		pipeWriter:  pw,
-		config:      cfg,
-		restartCh:   make(chan struct{}, 1),
-	}
-
-	if cfg.Device == "" {
-		p.deviceMonitor, err = NewDeviceMonitor()
-		if err != nil {
-			fmt.Printf("Warning: Could not start device monitor: %v\n", err)
-		} else {
-			p.deviceMonitor.OnDefaultDeviceChanged(func(eventType string) {
-				p.triggerRestart()
-			})
-			fmt.Println("Device monitor started - will auto-switch on default device changes")
-		}
-	}
-
-	return p, nil
+	return &Player{
+		ctx:        otoCtx,
+		pipeReader: pr,
+		pipeWriter: pw,
+		config:     cfg,
+		volume:     1.0,
+	}, nil
 }
 
-func (p *Player) triggerRestart() {
-	select {
-	case p.restartCh <- struct{}{}:
-		fmt.Println("Device change detected, signaling restart...")
-	default:
+// SetVolume sets the playback volume in [0, 1].
+func (p *Player) SetVolume(v float64) {
+	if v < 0 {
+		v = 0
+	}
+	if v > 1 {
+		v = 1
+	}
+	p.mu.Lock()
+	p.volume = v
+	player := p.player
+	p.mu.Unlock()
+	if player != nil {
+		player.SetVolume(v)
 	}
 }
 
-func (p *Player) RestartCh() <-chan struct{} {
-	return p.restartCh
-}
-
+// Start creates the playback player and begins consuming from the pipe.
 func (p *Player) Start() error {
-	return p.createPlaybackStream()
-}
-
-func (p *Player) createPlaybackStream() error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.playStream != nil {
-		p.playStream.Stop()
-		p.playStream = nil
+	if p.isPlaying {
+		p.player.Play()
+		return nil
 	}
 
-	var playbackOpts []pulse.PlaybackOption
-	playbackOpts = append(playbackOpts,
-		pulse.PlaybackSampleRate(p.config.SampleRate),
-		pulse.PlaybackLatency(float64(p.config.BufferMs)/1000.0),
-	)
-
-	if p.config.Channels == 2 {
-		playbackOpts = append(playbackOpts, pulse.PlaybackStereo)
-	} else {
-		playbackOpts = append(playbackOpts, pulse.PlaybackMono)
-	}
-
-	if p.config.Device != "" {
-		sinks, err := p.pulseClient.ListSinks()
-		if err == nil {
-			for _, s := range sinks {
-				if strings.Contains(strings.ToLower(s.Name()), strings.ToLower(p.config.Device)) ||
-					strings.Contains(strings.ToLower(s.ID()), strings.ToLower(p.config.Device)) {
-					fmt.Printf("Selected Playback Sink: %s (%s)\n", s.Name(), s.ID())
-					playbackOpts = append(playbackOpts, pulse.PlaybackSink(s))
-					break
-				}
-			}
-		}
-	}
-
-	reader := pulse.NewReader(p.pipeReader, proto.FormatInt16LE)
-
-	var err error
-	p.playStream, err = p.pulseClient.NewPlayback(reader, playbackOpts...)
-	if err != nil {
-		return fmt.Errorf("could not create playback stream: %w", err)
-	}
-
-	p.playStream.Start()
+	p.player = p.ctx.NewPlayer(p.pipeReader)
+	bytesPerSec := p.config.SampleRate * p.config.Channels * (p.config.BitsPerSample / 8)
+	p.player.SetBufferSize((bytesPerSec * p.config.BufferMs) / 1000)
+	p.player.SetVolume(p.volume)
+	p.player.Play()
 	p.isPlaying = true
-	fmt.Println("Playback started")
-
 	return nil
 }
 
@@ -127,30 +97,25 @@ func (p *Player) Write(data []byte) error {
 
 func (p *Player) Stop() {
 	p.mu.Lock()
-	p.isPlaying = false
-	if p.playStream != nil {
-		p.playStream.Stop()
+	defer p.mu.Unlock()
+	if p.player != nil {
+		p.player.Pause()
+		p.player.Close()
+		p.player = nil
 	}
-	p.mu.Unlock()
+	p.isPlaying = false
 }
 
-func (p *Player) Drain() {
-	p.mu.Lock()
-	if p.playStream != nil {
-		p.playStream.Drain()
-	}
-	p.mu.Unlock()
-}
+func (p *Player) Drain() {}
 
 func (p *Player) Close() {
 	p.Stop()
 	if p.pipeWriter != nil {
-		p.pipeWriter.Close()
+		_ = p.pipeWriter.Close()
 	}
-	if p.deviceMonitor != nil {
-		p.deviceMonitor.Close()
-	}
-	if p.pulseClient != nil {
-		p.pulseClient.Close()
-	}
+}
+
+func (p *Player) RestartCh() <-chan struct{} {
+	ch := make(chan struct{})
+	return ch
 }

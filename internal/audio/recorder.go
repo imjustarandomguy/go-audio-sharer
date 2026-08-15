@@ -93,7 +93,22 @@ func (r *Recorder) Unsubscribe(ch chan CapturedBlock) {
 	r.broadcaster.UnsubscribeWithChan(ch)
 }
 
+// Restart stops and restarts capturing so the target device is re-detected.
+func (r *Recorder) Restart() {
+	r.stopRecording()
+	time.Sleep(200 * time.Millisecond)
+	r.startRecording()
+	fmt.Println("Recorder restarted")
+}
+
 func (r *Recorder) startRecording() {
+	r.mu.Lock()
+	if r.isRecording {
+		r.mu.Unlock()
+		return
+	}
+	r.mu.Unlock()
+
 	var opts []pulse.RecordOption
 	found := false
 
@@ -112,13 +127,13 @@ func (r *Recorder) startRecording() {
 		}
 
 		if !found {
-		sources, err := r.client.ListSources()
-		if err == nil {
-			for _, s := range sources {
-				if strings.Contains(strings.ToLower(s.Name()), strings.ToLower(r.config.Device)) ||
-					strings.Contains(strings.ToLower(s.ID()), strings.ToLower(r.config.Device)) {
-					fmt.Printf("Selected Source: %s (%s)\n", s.Name(), s.ID())
-					opts = append(opts, pulse.RecordSource(s))
+			sources, err := r.client.ListSources()
+			if err == nil {
+				for _, s := range sources {
+					if strings.Contains(strings.ToLower(s.Name()), strings.ToLower(r.config.Device)) ||
+						strings.Contains(strings.ToLower(s.ID()), strings.ToLower(r.config.Device)) {
+						fmt.Printf("Selected Source: %s (%s)\n", s.Name(), s.ID())
+						opts = append(opts, pulse.RecordSource(s))
 						found = true
 						break
 					}
@@ -127,8 +142,8 @@ func (r *Recorder) startRecording() {
 		}
 
 		if !found {
-		fmt.Printf("Warning: Device '%s' not found, using default.\n", r.config.Device)
-	}
+			fmt.Printf("Warning: Device '%s' not found, using default.\n", r.config.Device)
+		}
 	}
 
 	if len(opts) == 0 {

@@ -1,121 +1,165 @@
 package main
 
 import (
-	"context"
-	"flag"
-	"io"
 	"log"
 	"os"
-	"os/signal"
-	"syscall"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/emptypb"
+	"fyne.io/systray"
 
-	"go-audio-sharer/internal/audio"
-	pb "go-audio-sharer/proto"
+	"go-audio-sharer/internal/client"
+	"go-audio-sharer/internal/config"
+	"go-audio-sharer/internal/netutil"
+	"go-audio-sharer/internal/tray"
 )
 
 func main() {
-	serverAddr := flag.String("server", "localhost:50051", "The server address in the format of host:port")
-	device := flag.String("device", "", "Audio device name to play to (optional)")
-	latencyMs := flag.Int("latency", 100, "Playback latency in milliseconds")
-	flag.Parse()
-
-	log.Printf("Connecting to server: %s", *serverAddr)
-	conn, err := grpc.NewClient(*serverAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("did not connect: %v", err)
-	}
-	defer conn.Close()
-	c := pb.NewAudioStreamClient(conn)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigCh
-		log.Println("Shutting down...")
-		cancel()
-	}()
-
-	fmtInfo, err := c.GetFormat(ctx, &emptypb.Empty{})
-	if err != nil {
-		log.Fatalf("could not get audio format: %v", err)
-	}
-	log.Printf("Audio Format: %s %dHz %dCh", fmtInfo.Codec, fmtInfo.SampleRate, fmtInfo.Channels)
-
-	stream, err := c.GetStream(ctx, &emptypb.Empty{})
-	if err != nil {
-		log.Fatalf("could not create stream: %v", err)
+		log.Fatalf("could not load config: %v", err)
 	}
 
-	cfg := audio.Config{
-		SampleRate:    int(fmtInfo.SampleRate),
-		Channels:      int(fmtInfo.Channels),
-		BitsPerSample: int(fmtInfo.BitsPerSample),
-		BufferMs:      *latencyMs,
-		Device:        *device,
+	app := client.New(cfg)
+	if cfg.AutoConnect {
+		app.Start()
 	}
-	player, err := audio.NewPlayer(cfg)
-	if err != nil {
-		log.Fatalf("Could not create player: %v", err)
-	}
-	defer player.Close()
 
-	done := make(chan struct{})
+	onReady := func() {
+		systray.SetIcon(tray.ClientIcon)
+		systray.SetTooltip("Audio Sharer Client")
 
-	go func() {
-		defer close(done)
-		for {
-			in, err := stream.Recv()
-			if err == io.EOF {
-				return
-			}
-			if err != nil {
-				if ctx.Err() != nil {
-					log.Printf("Stream cancelled: %v", ctx.Err())
-				} else {
-					log.Printf("Failed to receive: %v", err)
+		var statusItem *systray.MenuItem
+		var rebuild func()
+
+		rebuild = func() {
+			systray.ResetMenu()
+
+			statusItem = systray.AddMenuItem("Status: "+app.Status(), "")
+			statusItem.Disable()
+
+			cfg := app.Config()
+
+			serverItem := systray.AddMenuItem("Server", "gRPC server address")
+			addrItem := serverItem.AddSubMenuItem(cfg.Server, "")
+			addrItem.Disable()
+			openCfgItem := serverItem.AddSubMenuItem("Open config file…", "Edit the server address in the config JSON")
+			go func() {
+				for range openCfgItem.ClickedCh {
+					_ = openConfig()
 				}
-				return
-			}
-			if err := player.Write(in.Data); err != nil {
-				if ctx.Err() != nil {
-					log.Printf("Write cancelled: %v", ctx.Err())
-				} else {
-					log.Printf("Failed to write to playback: %v", err)
+			}()
+			reloadCfgItem := serverItem.AddSubMenuItem("Reload config", "Re-read config from disk and reconnect")
+			go func() {
+				for range reloadCfgItem.ClickedCh {
+					app.Reload()
+					app.Restart()
+					rebuild()
 				}
-				return
+			}()
+
+			ifaceMenu := systray.AddMenuItem("Network Interface", "Choose LAN interface to route around a VPN")
+			autoItem := ifaceMenu.AddSubMenuItemCheckbox("Automatic (default)", "", cfg.Interface == "")
+			for _, iface := range netutil.Interfaces() {
+				item := ifaceMenu.AddSubMenuItemCheckbox(
+					iface.Name+" ("+iface.IP.String()+")", "", cfg.Interface == iface.Name)
+				it := item
+				name := iface.Name
+				go func() {
+					for range it.ClickedCh {
+						app.SetInterface(name)
+						rebuild()
+					}
+				}()
 			}
+			go func() {
+				for range autoItem.ClickedCh {
+					app.SetInterface("")
+					rebuild()
+				}
+			}()
+
+			volMenu := systray.AddMenuItem("Volume", "Playback volume")
+			for _, p := range []struct {
+				label string
+				v     float64
+			}{
+				{"Mute", 0}, {"25%", 0.25}, {"50%", 0.5}, {"75%", 0.75}, {"100%", 1},
+			} {
+				preset := volMenu.AddSubMenuItemCheckbox(p.label, "", cfg.Volume == p.v)
+				pp := p
+				go func() {
+					for range preset.ClickedCh {
+						app.SetVolume(pp.v)
+						rebuild()
+					}
+				}()
+			}
+
+			systray.AddSeparator()
+			startItem := systray.AddMenuItem("Start", "Connect to the server")
+			stopItem := systray.AddMenuItem("Stop", "Disconnect from the server")
+			restartItem := systray.AddMenuItem("Restart", "Reconnect now")
+			systray.AddSeparator()
+			quitItem := systray.AddMenuItem("Exit", "Quit")
+
+			go func() {
+				for range startItem.ClickedCh {
+					app.Start()
+					rebuild()
+				}
+			}()
+			go func() {
+				for range stopItem.ClickedCh {
+					app.Stop()
+					rebuild()
+				}
+			}()
+			go func() {
+				for range restartItem.ClickedCh {
+					app.Restart()
+					rebuild()
+				}
+			}()
+			go func() {
+				for range quitItem.ClickedCh {
+					app.Stop()
+					systray.Quit()
+				}
+			}()
 		}
-	}()
 
-	if err := player.Start(); err != nil {
-		log.Fatalf("Could not start playback: %v", err)
-	}
-
-	go func() {
-		for {
-			select {
-			case <-player.RestartCh():
-				log.Println("Restarting playback on new device...")
-				if err := player.Start(); err != nil {
-					log.Printf("Error restarting playback: %v", err)
-				}
-			case <-done:
-				return
-			case <-ctx.Done():
-				return
+		app.SetStatusCallback(func() {
+			if statusItem != nil {
+				statusItem.SetTitle("Status: " + app.Status())
 			}
-		}
-	}()
+		})
 
-	select {
-	case <-done:
-	case <-ctx.Done():
+		rebuild()
 	}
 
-	player.Drain()
+	tray.Run(onReady, func() {
+		app.Stop()
+		os.Exit(0)
+	})
+}
+
+// openConfig opens the client config JSON in the system default editor/text editor.
+func openConfig() error {
+	p, err := config.Path()
+	if err != nil {
+		return err
+	}
+	_ = os.MkdirAll(filepath.Dir(p), 0o755)
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("notepad", p)
+	case "darwin":
+		cmd = exec.Command("open", p)
+	default:
+		cmd = exec.Command("xdg-open", p)
+	}
+	return cmd.Start()
 }

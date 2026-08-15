@@ -7,13 +7,22 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"runtime"
+	"syscall"
 	"time"
 
+	"fyne.io/systray"
 	"github.com/gorilla/websocket"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/protobuf/types/known/emptypb"
 
 	"go-audio-sharer/internal/audio"
+	"go-audio-sharer/internal/server"
+	"go-audio-sharer/internal/tray"
 	pb "go-audio-sharer/proto"
 )
 
@@ -23,34 +32,61 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
-type server struct {
+// execCommand opens a URL in the user's default browser.
+func execCommand(url string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
+type streamServer struct {
 	pb.UnimplementedAudioStreamServer
 	recorder *audio.Recorder
 	config   audio.Config
+	registry *server.ConnRegistry
+	restart  func()
 }
 
-func (s *server) GetStream(_ *emptypb.Empty, stream pb.AudioStream_GetStreamServer) error {
-	log.Println("New client connected")
-	ch := s.recorder.Subscribe()
+func remoteAddr(ctx context.Context) string {
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		return p.Addr.String()
+	}
+	return "unknown"
+}
+
+func (s *streamServer) GetStream(_ *emptypb.Empty, stream pb.AudioStream_GetStreamServer) error {
+	addr := remoteAddr(stream.Context())
+	log.Printf("New client connected: %s", addr)
+	s.registry.Add(addr)
 	defer func() {
-		s.recorder.Unsubscribe(ch)
-		log.Println("Client disconnected")
+		s.registry.Remove(addr)
+		log.Printf("Client disconnected: %s", addr)
 	}()
+
+	ch := s.recorder.Subscribe()
+	defer s.recorder.Unsubscribe(ch)
 
 	for block := range ch {
 		err := stream.Send(&pb.AudioSample{
-			Timestamp: block.Time.Format(time.RFC3339Nano), // ISO8601 Round-trip
+			Timestamp: block.Time.Format(time.RFC3339Nano),
 			Data:      block.Data,
 		})
 		if err != nil {
-			log.Printf("Error sending stream: %v", err)
+			log.Printf("Error sending stream to %s: %v", addr, err)
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *server) GetFormat(_ context.Context, _ *emptypb.Empty) (*pb.AudioFormat, error) {
+func (s *streamServer) GetFormat(_ context.Context, _ *emptypb.Empty) (*pb.AudioFormat, error) {
 	bytesPerSec := s.config.SampleRate * s.config.Channels * (s.config.BitsPerSample / 8)
 	return &pb.AudioFormat{
 		AverageBytesPerSecond: int32(bytesPerSec),
@@ -64,7 +100,7 @@ func (s *server) GetFormat(_ context.Context, _ *emptypb.Empty) (*pb.AudioFormat
 	}, nil
 }
 
-func wsStreamAudio(recorder *audio.Recorder, config audio.Config) http.HandlerFunc {
+func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, config audio.Config, restart func()) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -73,14 +109,15 @@ func wsStreamAudio(recorder *audio.Recorder, config audio.Config) http.HandlerFu
 		}
 		defer conn.Close()
 
+		addr := r.RemoteAddr
+		log.Printf("WebSocket client connected: %s", addr)
+		registry.Add(addr)
+		defer registry.Remove(addr)
+
 		conn.SetCloseHandler(func(code int, text string) error {
-			log.Printf("WebSocket closed by client: %d %s", code, text)
+			log.Printf("WebSocket closed by %s: %d %s", addr, code, text)
 			return nil
 		})
-
-		log.Println("WebSocket client connected")
-		ch := recorder.Subscribe()
-		defer recorder.Unsubscribe(ch)
 
 		if err := conn.WriteJSON(map[string]interface{}{
 			"sampleRate":    config.SampleRate,
@@ -90,6 +127,9 @@ func wsStreamAudio(recorder *audio.Recorder, config audio.Config) http.HandlerFu
 			log.Printf("WebSocket write format error: %v", err)
 			return
 		}
+
+		ch := recorder.Subscribe()
+		defer recorder.Unsubscribe(ch)
 
 		for block := range ch {
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -108,6 +148,7 @@ func main() {
 	channels := flag.Int("channels", 2, "Number of channels")
 	bits := flag.Int("bits", 16, "Bits per sample")
 	device := flag.String("device", "", "Audio device name to loopback from (optional)")
+	noTray := flag.Bool("no-tray", false, "Run headless without a system tray icon")
 	flag.Parse()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", *port))
@@ -131,26 +172,122 @@ func main() {
 	}
 	defer recorder.Close()
 
-	s := grpc.NewServer()
-	pb.RegisterAudioStreamServer(s, &server{
+	registry := server.NewConnRegistry()
+	ss := &streamServer{
 		recorder: recorder,
 		config:   config,
-	})
+		registry: registry,
+		restart:  recorder.Restart,
+	}
 
+	grpcServer := grpc.NewServer()
+	pb.RegisterAudioStreamServer(grpcServer, ss)
+
+	httpServer := &http.Server{}
 	go func() {
-		httpMux := http.NewServeMux()
-		httpMux.HandleFunc("/ws", wsStreamAudio(recorder, config))
-		httpMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/ws", wsStreamAudio(recorder, registry, config, recorder.Restart))
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			http.ServeFile(w, r, "web/index.html")
 		})
 		log.Printf("HTTP/WebSocket server listening on :8080")
-		if err := http.ListenAndServe(":8080", httpMux); err != nil {
-			log.Fatalf("HTTP server failed: %v", err)
+		httpServer.Handler = mux
+		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("HTTP server failed: %v", err)
 		}
 	}()
 
-	log.Printf("gRPC server listening on %v", lis.Addr())
-	if err := s.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+	go func() {
+		log.Printf("gRPC server listening on %v", lis.Addr())
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("failed to serve: %v", err)
+		}
+	}()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	shutdown := func() {
+		grpcServer.GracefulStop()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(ctx)
 	}
+
+	if *noTray {
+		select {
+		case <-sigCh:
+			shutdown()
+		}
+		return
+	}
+
+	onReady := func() {
+		systray.SetIcon(tray.ServerIcon)
+		systray.SetTooltip("Audio Sharer Server")
+
+		var statusItem *systray.MenuItem
+		var clientsItem *systray.MenuItem
+
+		rebuildClients := func() {
+			if clientsItem == nil {
+				return
+			}
+			clients := registry.List()
+			if len(clients) == 0 {
+				clientsItem.SetTitle("Connected clients: none")
+			} else {
+				clientsItem.SetTitle(fmt.Sprintf("Connected clients (%d)", len(clients)))
+			}
+		}
+
+		rebuild := func() {
+			systray.ResetMenu()
+			statusItem = systray.AddMenuItem("Status: Running", "")
+			statusItem.Disable()
+
+			clientsItem = systray.AddMenuItem("Connected clients: none", "")
+			clientsItem.Disable()
+			rebuildClients()
+
+			webItem := systray.AddMenuItem("Open Web Player", "Open the web client in a browser")
+			restartItem := systray.AddMenuItem("Restart", "Restart audio capturing (re-detect device)")
+			systray.AddSeparator()
+			quitItem := systray.AddMenuItem("Quit", "Stop the server")
+
+			go func() {
+				for range webItem.ClickedCh {
+					_ = execCommand("http://localhost:8080")
+				}
+			}()
+			go func() {
+				for range restartItem.ClickedCh {
+					ss.restart()
+					statusItem.SetTitle("Status: Running")
+					rebuildClients()
+				}
+			}()
+			go func() {
+				for range quitItem.ClickedCh {
+					systray.Quit()
+				}
+			}()
+		}
+
+		rebuild()
+
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				rebuildClients()
+			}
+		}()
+	}
+
+	tray.Run(onReady, func() {
+		shutdown()
+		recorder.Close()
+		os.Exit(0)
+	})
 }
