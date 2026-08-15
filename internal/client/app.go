@@ -241,6 +241,7 @@ func (a *App) connectAndStream(ctx context.Context) error {
 		Channels:      int(fmtInfo.Channels),
 		BitsPerSample: int(fmtInfo.BitsPerSample),
 		BufferMs:      a.Config().LatencyMs,
+		Device:        a.Config().Device,
 	}
 
 	p, err := audio.NewPlayer(cfg)
