@@ -223,22 +223,32 @@ func main() {
 
 		rebuild()
 
-		// Update the live latency display while connected.
+		// Update the live latency display while connected. Only touch the menu
+		// item when the displayed text actually changes, so the open popup isn't
+		// re-rendered (which clears the hover highlight on KDE) on every tick.
 		go func() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
+			var last string
 			for range ticker.C {
 				rebuildMu.Lock()
 				item := latencyItem
 				rebuildMu.Unlock()
 				if item == nil {
+					last = ""
 					continue
 				}
+				var s string
 				if app.Status() == "Connected" {
-					item.SetTitle(fmt.Sprintf("Latency: %.0f ms", app.CurrentLatencyMs()))
+					s = fmt.Sprintf("Latency: %.0f ms", app.CurrentLatencyMs())
 				} else {
-					item.SetTitle("Latency: —")
+					s = "Latency: —"
 				}
+				if s == last {
+					continue
+				}
+				item.SetTitle(s)
+				last = s
 			}
 		}()
 

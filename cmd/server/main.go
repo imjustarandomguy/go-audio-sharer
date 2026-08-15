@@ -365,11 +365,18 @@ func main() {
 
 		rebuild()
 
+		// Refresh the connected-clients count, but only touch the menu item when
+		// the count actually changes (avoids re-rendering the open popup on KDE).
 		go func() {
+			lastCount := -1
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			for range ticker.C {
-				rebuildClients()
+				cur := registry.Count()
+				if cur != lastCount {
+					rebuildClients()
+					lastCount = cur
+				}
 			}
 		}()
 
