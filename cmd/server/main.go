@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"go-audio-sharer/internal/audio"
 	"go-audio-sharer/internal/server"
 	"go-audio-sharer/internal/tray"
+	webpage "go-audio-sharer/internal/web"
 	pb "go-audio-sharer/proto"
 )
 
@@ -44,6 +46,20 @@ func execCommand(url string) error {
 		cmd = exec.Command("xdg-open", url)
 	}
 	return cmd.Start()
+}
+
+// localURL converts a listen address like ":8080" or "0.0.0.0:8080" into a
+// browser URL on localhost, e.g. "http://localhost:8080".
+func localURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		// fall back to treating the whole string as a port
+		return "http://localhost:" + strings.TrimPrefix(addr, ":")
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 type streamServer struct {
@@ -148,12 +164,20 @@ func main() {
 	channels := flag.Int("channels", 2, "Number of channels")
 	bits := flag.Int("bits", 16, "Bits per sample")
 	device := flag.String("device", "", "Audio device name to loopback from (optional)")
+	webAddr := flag.String("web-addr", ":8080", "Address for the HTTP/WebSocket web player")
 	noTray := flag.Bool("no-tray", false, "Run headless without a system tray icon")
 	flag.Parse()
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", *port))
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
+	}
+
+	gRPCAddr := fmt.Sprintf(":%s", *port)
+	webURL := localURL(*webAddr)
+	grpcDisplay := gRPCAddr
+	if strings.HasPrefix(grpcDisplay, ":") {
+		grpcDisplay = "127.0.0.1" + grpcDisplay
 	}
 
 	config := audio.Config{
@@ -188,9 +212,11 @@ func main() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/ws", wsStreamAudio(recorder, registry, config, recorder.Restart))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			http.ServeFile(w, r, "web/index.html")
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(webpage.IndexHTML))
 		})
-		log.Printf("HTTP/WebSocket server listening on :8080")
+		log.Printf("HTTP/WebSocket server listening on %s", *webAddr)
+		httpServer.Addr = *webAddr
 		httpServer.Handler = mux
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server failed: %v", err)
@@ -224,7 +250,7 @@ func main() {
 
 	onReady := func() {
 		systray.SetIcon(tray.ServerIcon)
-		systray.SetTooltip("Audio Sharer Server")
+		systray.SetTooltip(fmt.Sprintf("Audio Sharer Server (%s)", grpcDisplay))
 
 		var statusItem *systray.MenuItem
 		var clientsItem *systray.MenuItem
@@ -243,27 +269,30 @@ func main() {
 
 		rebuild := func() {
 			systray.ResetMenu()
-			statusItem = systray.AddMenuItem("Status: Running", "")
+			statusItem = systray.AddMenuItem(fmt.Sprintf("Status: Running (%s)", grpcDisplay), "")
 			statusItem.Disable()
+
+			webItem := systray.AddMenuItem("Open Web Player", "Open the web client in a browser")
+			webAddrItem := systray.AddMenuItem(fmt.Sprintf("Web player: %s", webURL), "")
+			webAddrItem.Disable()
 
 			clientsItem = systray.AddMenuItem("Connected clients: none", "")
 			clientsItem.Disable()
 			rebuildClients()
 
-			webItem := systray.AddMenuItem("Open Web Player", "Open the web client in a browser")
 			restartItem := systray.AddMenuItem("Restart", "Restart audio capturing (re-detect device)")
 			systray.AddSeparator()
 			quitItem := systray.AddMenuItem("Quit", "Stop the server")
 
 			go func() {
 				for range webItem.ClickedCh {
-					_ = execCommand("http://localhost:8080")
+					_ = execCommand(webURL)
 				}
 			}()
 			go func() {
 				for range restartItem.ClickedCh {
 					ss.restart()
-					statusItem.SetTitle("Status: Running")
+					statusItem.SetTitle(fmt.Sprintf("Status: Running (%s)", grpcDisplay))
 					rebuildClients()
 				}
 			}()

@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"time"
 
 	"fyne.io/systray"
 
@@ -16,13 +18,42 @@ import (
 	"go-audio-sharer/internal/tray"
 )
 
+// devState caches the latest playback device list (refreshed periodically).
+var devState struct {
+	mu   sync.Mutex
+	devs []audio.DeviceDesc
+}
+
+var (
+	rebuildMu sync.Mutex
+	rebuild   func()
+)
+
+func devSnapshot() []audio.DeviceDesc {
+	devState.mu.Lock()
+	defer devState.mu.Unlock()
+	out := make([]audio.DeviceDesc, len(devState.devs))
+	copy(out, devState.devs)
+	return out
+}
+
+func safeRebuild() {
+	rebuildMu.Lock()
+	defer rebuildMu.Unlock()
+	if rebuild != nil {
+		rebuild()
+	}
+}
+
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("could not load config: %v", err)
 	}
 
-	audioDevices, _ := audio.ListPlaybackDeviceDescriptions()
+	if devs, err := audio.ListPlaybackDeviceDescriptions(); err == nil {
+		devState.devs = devs
+	}
 
 	app := client.New(cfg)
 	if cfg.AutoConnect {
@@ -34,7 +65,6 @@ func main() {
 		systray.SetTooltip("Audio Sharer Client")
 
 		var statusItem *systray.MenuItem
-		var rebuild func()
 
 		rebuild = func() {
 			systray.ResetMenu()
@@ -58,7 +88,7 @@ func main() {
 				for range reloadCfgItem.ClickedCh {
 					app.Reload()
 					app.Restart()
-					rebuild()
+					safeRebuild()
 				}
 			}()
 
@@ -72,39 +102,38 @@ func main() {
 				go func() {
 					for range it.ClickedCh {
 						app.SetInterface(name)
-						rebuild()
+						safeRebuild()
 					}
 				}()
 			}
 			go func() {
 				for range autoItem.ClickedCh {
 					app.SetInterface("")
-					rebuild()
+					safeRebuild()
 				}
 			}()
 
-			devMenu := systray.AddMenuItem("Audio Device", "Choose audio output device or follow default")
-			autoDev := devMenu.AddSubMenuItemCheckbox("Default (follow)", "Follow the system default output device", cfg.Device == "")
-			for _, dev := range audioDevices {
+			devMenu := systray.AddMenuItem("Audio Device", "Choose an output device, or follow the system default")
+			autoDev := devMenu.AddSubMenuItemCheckbox("Default (follow)", "", cfg.Device == "")
+			for _, dev := range devSnapshot() {
 				label := dev.Name
 				if dev.IsDefault {
 					label += " (default)"
 				}
-				item := devMenu.AddSubMenuItemCheckbox(label, "", cfg.Device == dev.Name)
+				item := devMenu.AddSubMenuItemCheckbox(label, dev.ID, cfg.Device == dev.Name)
 				it := item
 				name := dev.Name
 				go func() {
 					for range it.ClickedCh {
 						app.SetDevice(name)
-						rebuild()
+						safeRebuild()
 					}
 				}()
 			}
-			autoDevItem := autoDev
 			go func() {
-				for range autoDevItem.ClickedCh {
+				for range autoDev.ClickedCh {
 					app.SetDevice("")
-					rebuild()
+					safeRebuild()
 				}
 			}()
 
@@ -120,7 +149,7 @@ func main() {
 				go func() {
 					for range preset.ClickedCh {
 						app.SetVolume(pp.v)
-						rebuild()
+						safeRebuild()
 					}
 				}()
 			}
@@ -135,19 +164,19 @@ func main() {
 			go func() {
 				for range startItem.ClickedCh {
 					app.Start()
-					rebuild()
+					safeRebuild()
 				}
 			}()
 			go func() {
 				for range stopItem.ClickedCh {
 					app.Stop()
-					rebuild()
+					safeRebuild()
 				}
 			}()
 			go func() {
 				for range restartItem.ClickedCh {
 					app.Restart()
-					rebuild()
+					safeRebuild()
 				}
 			}()
 			go func() {
@@ -165,12 +194,44 @@ func main() {
 		})
 
 		rebuild()
+
+		// Refresh the device list and menu when it changes (e.g. the system
+		// default output device changes).
+		go func() {
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				devs, err := audio.ListPlaybackDeviceDescriptions()
+				if err != nil {
+					continue
+				}
+				changed := !sameDevices(devs, devSnapshot())
+				devState.mu.Lock()
+				devState.devs = devs
+				devState.mu.Unlock()
+				if changed {
+					safeRebuild()
+				}
+			}
+		}()
 	}
 
 	tray.Run(onReady, func() {
 		app.Stop()
 		os.Exit(0)
 	})
+}
+
+func sameDevices(a, b []audio.DeviceDesc) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].IsDefault != b[i].IsDefault {
+			return false
+		}
+	}
+	return true
 }
 
 // openConfig opens the client config JSON in the system default editor/text editor.

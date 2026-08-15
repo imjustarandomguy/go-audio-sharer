@@ -64,13 +64,14 @@ CGO_ENABLED=1 GOOS=windows CC=x86_64-w64-mingw32-gcc \
 | `-rate`     | Sample rate                                          | `48000`  |
 | `-channels` | Channels                                             | `2`      |
 | `-bits`     | Bits per sample                                      | `16`     |
+| `-web-addr` | Address for the HTTP/WebSocket web player            | `:8080`  |
 | `-no-tray`  | Run headless without a system tray icon              | `false`  |
 
 ### Tray icon
 
-The server shows a tray icon with:
+The server shows a tray icon with the active gRPC port and web player address, and:
 - **Connected clients** count and list (updates live),
-- **Open Web Player** (opens the web client on `:8080`),
+- **Open Web Player** (opens the web client at the configured web address),
 - **Restart** (re-detect/restart audio capturing),
 - **Quit**.
 
