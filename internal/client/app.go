@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ebitengine/oto/v3"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -27,7 +26,6 @@ const (
 type App struct {
 	cfg           config.Config
 	mu            sync.Mutex
-	otoCtx        *oto.Context
 	currentPlayer *audio.Player
 	running       bool
 	cancel        context.CancelFunc
@@ -81,6 +79,20 @@ func (a *App) SetInterface(name string) {
 	a.mu.Lock()
 	changed := a.cfg.Interface != name
 	a.cfg.Interface = name
+	wasRunning := a.running
+	a.mu.Unlock()
+	a.saveConfig()
+	if changed && wasRunning {
+		a.Restart()
+	}
+}
+
+// SetDevice updates the preferred audio output device (substring match) and
+// restarts if running. Pass "" to follow the system default device.
+func (a *App) SetDevice(name string) {
+	a.mu.Lock()
+	changed := a.cfg.Device != name
+	a.cfg.Device = name
 	wasRunning := a.running
 	a.mu.Unlock()
 	a.saveConfig()
@@ -231,7 +243,7 @@ func (a *App) connectAndStream(ctx context.Context) error {
 		BufferMs:      a.Config().LatencyMs,
 	}
 
-	p, err := a.newPlayer(cfg)
+	p, err := audio.NewPlayer(cfg)
 	if err != nil {
 		return err
 	}
@@ -297,21 +309,6 @@ func (a *App) SetVolume(v float64) {
 		player.SetVolume(v)
 	}
 	_ = cfg.Save()
-}
-
-// newPlayer returns a player backed by the process-wide Oto context.
-func (a *App) newPlayer(cfg audio.Config) (*audio.Player, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.otoCtx == nil {
-		ctx, ready, err := audio.NewAudioContext(cfg)
-		if err != nil {
-			return nil, err
-		}
-		<-ready
-		a.otoCtx = ctx
-	}
-	return audio.NewPlayer(a.otoCtx, cfg)
 }
 
 // watchInterface triggers an immediate reconnect when the preferred interface

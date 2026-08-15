@@ -2,12 +2,10 @@ package audio
 
 import (
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
-	"github.com/jfreymuth/pulse"
-	"github.com/jfreymuth/pulse/proto"
+	"github.com/gen2brain/malgo"
 )
 
 type Config struct {
@@ -19,31 +17,24 @@ type Config struct {
 }
 
 type Recorder struct {
-	client        *pulse.Client
-	stream        *pulse.RecordStream
-	broadcaster   *Broadcaster
-	config        Config
-	deviceMonitor *DeviceMonitor
-	mu            sync.Mutex
-	isRecording   bool
-}
-
-// AudioWriter implements pulse.Writer interface
-type AudioWriter struct {
-	callback func([]byte)
-}
-
-func (w *AudioWriter) Write(p []byte) (int, error) {
-	w.callback(p)
-	return len(p), nil
-}
-
-func (w *AudioWriter) Format() byte {
-	return proto.FormatInt16LE
+	client      *malgo.AllocatedContext
+	stream      *malgo.Device
+	broadcaster *Broadcaster
+	config      Config
+	monitor     *DeviceMonitor
+	mu          sync.Mutex
+	isRecording bool
+	captureID   malgo.DeviceID
 }
 
 func NewRecorder(cfg Config) (*Recorder, error) {
-	c, err := pulse.NewClient()
+	// Prefer PulseAudio on Linux for loopback support (ALSA has no loopback);
+	// falls back to ALSA/JACK where no PulseAudio server exists.
+	c, err := newAudioContextWith([]malgo.Backend{
+		malgo.BackendPulseaudio,
+		malgo.BackendAlsa,
+		malgo.BackendJack,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -52,34 +43,20 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 		client: c,
 		config: cfg,
 	}
-
 	r.broadcaster = NewBroadcaster(r.startRecording, r.stopRecording)
-
-	// Only monitor for default device changes if no specific device is configured
-	if cfg.Device == "" {
-		r.deviceMonitor, err = NewDeviceMonitor()
-		if err != nil {
-			fmt.Printf("Warning: Could not start device monitor: %v\n", err)
-			// Continue without monitoring - not a fatal error
-		} else {
-			r.deviceMonitor.OnDefaultDeviceChanged(func(eventType string) {
-				r.handleDeviceChange()
-			})
-			fmt.Println("Device monitor started - will auto-switch on default device changes")
-		}
-	}
-
+	r.monitor = newDeviceMonitor(c.Context, cfg.Device, func(info *malgo.DeviceInfo) {
+		r.handleDeviceChange(info)
+	})
 	return r, nil
 }
 
-// handleDeviceChange is called when the default audio device changes
-func (r *Recorder) handleDeviceChange() {
+// handleDeviceChange is called when the default audio device changes.
+func (r *Recorder) handleDeviceChange(info *malgo.DeviceInfo) {
 	r.mu.Lock()
 	wasRecording := r.isRecording
 	r.mu.Unlock()
-
 	if wasRecording {
-		fmt.Println("Default device changed, restarting recording...")
+		fmt.Println("Default device changed, restarting capture...")
 		r.stopRecording()
 		r.startRecording()
 	}
@@ -109,119 +86,87 @@ func (r *Recorder) startRecording() {
 	}
 	r.mu.Unlock()
 
-	var opts []pulse.RecordOption
-	found := false
-
-	if r.config.Device != "" {
-		sinks, err := r.client.ListSinks()
-		if err == nil {
-			for _, s := range sinks {
-				if strings.Contains(strings.ToLower(s.Name()), strings.ToLower(r.config.Device)) ||
-					strings.Contains(strings.ToLower(s.ID()), strings.ToLower(r.config.Device)) {
-					fmt.Printf("Selected Sink Monitor: %s (%s)\n", s.Name(), s.ID())
-					opts = append(opts, pulse.RecordMonitor(s))
-					found = true
-					break
-				}
-			}
-		}
-
-		if !found {
-			sources, err := r.client.ListSources()
-			if err == nil {
-				for _, s := range sources {
-					if strings.Contains(strings.ToLower(s.Name()), strings.ToLower(r.config.Device)) ||
-						strings.Contains(strings.ToLower(s.ID()), strings.ToLower(r.config.Device)) {
-						fmt.Printf("Selected Source: %s (%s)\n", s.Name(), s.ID())
-						opts = append(opts, pulse.RecordSource(s))
-						found = true
-						break
-					}
-				}
-			}
-		}
-
-		if !found {
-			fmt.Printf("Warning: Device '%s' not found, using default.\n", r.config.Device)
-		}
-	}
-
-	if len(opts) == 0 {
-		sink, err := r.client.DefaultSink()
-		if err != nil {
-			fmt.Printf("Error getting default sink: %v\n", err)
-			return
-		}
-		fmt.Printf("Using Default Sink Monitor: %s\n", sink.Name())
-		opts = append(opts, pulse.RecordMonitor(sink))
-	}
-
-	opts = append(opts, pulse.RecordSampleRate(r.config.SampleRate))
-	switch r.config.Channels {
-	case 2:
-		opts = append(opts, pulse.RecordStereo)
-	case 1:
-		opts = append(opts, pulse.RecordMono)
-	default:
-		opts = append(opts, pulse.RecordStereo)
-	}
-
-	bytesPerSample := r.config.BitsPerSample / 8
-	frameSize := r.config.Channels * bytesPerSample
-	bufferBytes := (r.config.SampleRate * frameSize * r.config.BufferMs) / 1000
-
-	// Ensure alignment
-	if bufferBytes%frameSize != 0 {
-		bufferBytes += frameSize - (bufferBytes % frameSize)
-	}
-
-	fmt.Printf("Buffer Config: %d ms -> %d bytes\n", r.config.BufferMs, bufferBytes)
-	opts = append(opts, pulse.RecordBufferFragmentSize(uint32(bufferBytes)))
-
-	writer := &AudioWriter{
-		callback: func(data []byte) {
-			r.broadcaster.Broadcast(CapturedBlock{
-				Data: data,
-				Time: time.Now().UTC(),
-			})
-		},
-	}
-
-	var err error
-	r.stream, err = r.client.NewRecord(writer, opts...)
+	// The monitor tracks the playback (sink) device; find it so we can seed its
+	// current id correctly.
+	play, err := playbackDevice(r.client.Context, r.config.Device)
 	if err != nil {
-		fmt.Printf("Error creating record stream: %v\n", err)
+		fmt.Printf("Error selecting output to loop back: %v\n", err)
+		return
+	}
+	if r.monitor != nil {
+		r.monitor.setCurrent(play.ID.String())
+	}
+
+	// Capture the monitor of the chosen/current default output device.
+	info, err := loopbackCaptureDevice(r.client.Context, r.config.Device)
+	if err != nil {
+		fmt.Printf("Error selecting monitor to loop back: %v\n", err)
+		return
+	}
+	r.mu.Lock()
+	r.captureID = info.ID
+	r.mu.Unlock()
+	fmt.Printf("Looping back output monitor: %s\n", info.Name())
+
+	dc := malgo.DefaultDeviceConfig(malgo.Capture)
+	dc.Capture.Format = malgo.FormatS16
+	dc.Capture.Channels = uint32(r.config.Channels)
+	dc.SampleRate = uint32(r.config.SampleRate)
+	dc.PeriodSizeInMilliseconds = uint32(r.config.BufferMs)
+	dc.Alsa.NoMMap = 1
+	dc.Capture.DeviceID = info.ID.Pointer()
+
+	stream, err := malgo.InitDevice(r.client.Context, dc, malgo.DeviceCallbacks{Data: r.onData})
+	if err != nil {
+		fmt.Printf("Error creating loopback capture: %v\n", err)
+		return
+	}
+	if err := stream.Start(); err != nil {
+		fmt.Printf("Error starting loopback capture: %v\n", err)
+		stream.Uninit()
 		return
 	}
 
-	r.stream.Start()
-
 	r.mu.Lock()
+	r.stream = stream
 	r.isRecording = true
 	r.mu.Unlock()
+	fmt.Println("Started loopback capture")
+}
 
-	fmt.Println("Started recording loopback audio")
+func (r *Recorder) onData(_, in []byte, framecount uint32) {
+	if len(in) == 0 {
+		return
+	}
+	block := make([]byte, len(in))
+	copy(block, in)
+	r.broadcaster.Broadcast(CapturedBlock{
+		Data: block,
+		Time: time.Now().UTC(),
+	})
 }
 
 func (r *Recorder) stopRecording() {
 	r.mu.Lock()
 	r.isRecording = false
+	stream := r.stream
+	r.stream = nil
 	r.mu.Unlock()
 
-	if r.stream != nil {
-		r.stream.Stop()
-		r.stream.Close()
-		r.stream = nil
-		fmt.Println("Stopped recording loopback audio")
+	if stream != nil {
+		_ = stream.Stop()
+		stream.Uninit()
+		fmt.Println("Stopped loopback capture")
 	}
 }
 
 func (r *Recorder) Close() {
 	r.stopRecording()
-	if r.deviceMonitor != nil {
-		r.deviceMonitor.Close()
+	if r.monitor != nil {
+		r.monitor.close()
 	}
 	if r.client != nil {
-		r.client.Close()
+		_ = r.client.Uninit()
+		r.client.Free()
 	}
 }

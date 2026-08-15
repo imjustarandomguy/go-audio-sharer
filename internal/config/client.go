@@ -10,6 +10,7 @@ import (
 type Config struct {
 	Server      string  `json:"server"`
 	Interface   string  `json:"interface"` // optional network interface (e.g. "Ethernet") to use
+	Device      string  `json:"device"`    // optional audio output device name substring
 	LatencyMs   int     `json:"latency_ms"`
 	AutoConnect bool    `json:"auto_connect"`
 	Volume      float64 `json:"volume"` // playback volume in [0, 1]

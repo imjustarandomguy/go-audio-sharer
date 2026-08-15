@@ -9,7 +9,7 @@ A high-performance, low-latency gRPC service to stream system loopback audio to 
 - **Tray Icon**: Both server and client run in the system tray (KDE Plasma, Windows, macOS).
 - **Client Auto-Reconnect**: The client reconnects automatically with backoff, and reconnects immediately when the network (or laptop wake) returns.
 - **Network Interface Selection**: The client can bind to a specific LAN interface so it avoids corporate VPN interfaces (like Deskflow).
-- **Cross-Platform Client**: Plays audio on Windows, macOS, and Linux via Oto.
+- **Cross-Platform Audio (malgo/miniaudio)**: Client selects an output device or automatically follows the OS default output device; server captures system loopback (Linux via the PulseAudio monitor).
 - **Configurable**: Adjustable sample rate, channels, bit depth, and target device.
 
 ## Build
@@ -18,32 +18,37 @@ A high-performance, low-latency gRPC service to stream system loopback audio to 
 # Regenerate proto files if you change proto/audio.proto
 ./build_proto.sh
 
-# Build the server
+# Build the server and client (native platform)
 go build -o audio_server cmd/server/main.go
-
-# Build the client (Linux/macOS)
 go build -o audio_client cmd/client/main.go
 
-# Build the Windows client (from this machine)
-./build_windows.sh   # or:
-# GOOS=windows GOARCH=amd64 go build -o audio_client.exe -ldflags "-H windowsgui" ./cmd/client
+# Windows client - see build_windows.sh
+./build_windows.sh
 ```
 
 ### Build dependencies (Linux)
 
-`systray` needs cgo + GTK on Linux:
+The tray (`systray`) and audio (`malgo`) both need cgo + dev libraries:
 
 ```bash
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev
+sudo apt install libgtk-3-dev libayatana-appindicator3-dev libasound2-dev
 ```
 
-Oto on Linux needs ALSA:
+### Windows build and cgo
+
+The audio backend is `malgo` (miniaudio), which uses **cgo**, so the Windows
+client is **not** a pure-Go cross-compile. Build it on the Windows machine, or
+with a mingw-w64 cross toolchain:
 
 ```bash
-sudo apt install libasound2-dev
-```
+# On Windows (recommended):
+go build -o audio_client.exe -ldflags "-H windowsgui" ./cmd/client
 
-The Windows build is pure-Go and can be cross-compiled from Linux with `CGO_ENABLED=0`.
+# Or from Linux with mingw-w64:
+sudo apt install gcc-mingw-w64-x86-64
+CGO_ENABLED=1 GOOS=windows CC=x86_64-w64-mingw32-gcc \
+  go build -o audio_client.exe -ldflags "-H windowsgui" ./cmd/client
+```
 
 ## Server Usage
 
@@ -88,6 +93,7 @@ Right-click the tray icon for:
 - **Start** / **Stop** / **Restart** / **Exit**,
 - **Network Interface**: pick the LAN interface (e.g. `Ethernet`/`Wi-Fi`) to route around your VPN,
 - **Volume**: mute / 25% / 50% / 75% / 100% presets,
+- **Audio Device**: pick a specific output device, or *Default (follow)* to automatically switch when you change the system default output,
 - **Server → Open config file…** and **Server → Reload config**: edit the server address in the config JSON from the tray,
 - live **Status** (Connected / Reconnecting / Disconnected).
 
@@ -110,6 +116,7 @@ Settings are kept in a JSON file and edited via the tray (interface) or config f
 {
   "server": "192.168.1.10:50051",
   "interface": "Ethernet",
+  "device": "",
   "latency_ms": 100,
   "auto_connect": true,
   "volume": 1.0
@@ -119,6 +126,9 @@ Settings are kept in a JSON file and edited via the tray (interface) or config f
 `interface` is optional; leave it `""` (Automatic) to use the OS default routing. To route around a
 VPN, set it to your LAN interface name. `server` should be your LAN address so it resolves over the
 picked interface.
+
+`device` is optional; leave it `""` (Default follow) to automatically use and follow the system default
+output device, or set a device name substring to pin playback to a specific audio output.
 
 ## Running as a Service (headless server, Linux)
 

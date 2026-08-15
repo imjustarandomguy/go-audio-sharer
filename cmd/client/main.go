@@ -9,6 +9,7 @@ import (
 
 	"fyne.io/systray"
 
+	"go-audio-sharer/internal/audio"
 	"go-audio-sharer/internal/client"
 	"go-audio-sharer/internal/config"
 	"go-audio-sharer/internal/netutil"
@@ -20,6 +21,8 @@ func main() {
 	if err != nil {
 		log.Fatalf("could not load config: %v", err)
 	}
+
+	audioDevices, _ := audio.ListPlaybackDeviceDescriptions()
 
 	app := client.New(cfg)
 	if cfg.AutoConnect {
@@ -76,6 +79,31 @@ func main() {
 			go func() {
 				for range autoItem.ClickedCh {
 					app.SetInterface("")
+					rebuild()
+				}
+			}()
+
+			devMenu := systray.AddMenuItem("Audio Device", "Choose audio output device or follow default")
+			autoDev := devMenu.AddSubMenuItemCheckbox("Default (follow)", "Follow the system default output device", cfg.Device == "")
+			for _, dev := range audioDevices {
+				label := dev.Name
+				if dev.IsDefault {
+					label += " (default)"
+				}
+				item := devMenu.AddSubMenuItemCheckbox(label, "", cfg.Device == dev.Name)
+				it := item
+				name := dev.Name
+				go func() {
+					for range it.ClickedCh {
+						app.SetDevice(name)
+						rebuild()
+					}
+				}()
+			}
+			autoDevItem := autoDev
+			go func() {
+				for range autoDevItem.ClickedCh {
+					app.SetDevice("")
 					rebuild()
 				}
 			}()
