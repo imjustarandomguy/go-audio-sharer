@@ -19,7 +19,7 @@ type Config struct {
 func Default() Config {
 	return Config{
 		Server:      "localhost:50051",
-		LatencyMs:   100,
+		LatencyMs:   10, // as low latency as possible by default
 		AutoConnect: true,
 		Volume:      1.0,
 	}

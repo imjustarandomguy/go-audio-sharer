@@ -94,9 +94,10 @@ Right-click the tray icon for:
 - **Start** / **Stop** / **Restart** / **Exit**,
 - **Network Interface**: pick the LAN interface (e.g. `Ethernet`/`Wi-Fi`) to route around your VPN,
 - **Volume**: mute / 25% / 50% / 75% / 100% presets,
+- **Latency**: preset playback latency targets (5–100 ms); defaults as low as possible (10ms),
 - **Audio Device**: pick a specific output device, or *Default (follow)* to automatically switch when you change the system default output,
 - **Server → Open config file…** and **Server → Reload config**: edit the server address in the config JSON from the tray,
-- live **Status** (Connected / Reconnecting / Disconnected).
+- live **Status** (Connected / Reconnecting / Disconnected) and a **Latency** readout (current buffered playback latency, refreshed every few seconds).
 
 ### Windows
 

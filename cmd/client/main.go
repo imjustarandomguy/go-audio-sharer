@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -65,12 +66,16 @@ func main() {
 		systray.SetTooltip("Audio Sharer Client")
 
 		var statusItem *systray.MenuItem
+		var latencyItem *systray.MenuItem
 
 		rebuild = func() {
 			systray.ResetMenu()
 
 			statusItem = systray.AddMenuItem("Status: "+app.Status(), "")
 			statusItem.Disable()
+
+			latencyItem = systray.AddMenuItem("Latency: —", "Current buffered playback latency")
+			latencyItem.Disable()
 
 			cfg := app.Config()
 
@@ -154,6 +159,24 @@ func main() {
 				}()
 			}
 
+			latencyMenu := systray.AddMenuItem("Latency", "Set target playback latency")
+			for _, p := range []struct {
+				label string
+				ms    int
+			}{
+				{"5 ms", 5}, {"10 ms", 10}, {"15 ms", 15}, {"20 ms", 20},
+				{"30 ms", 30}, {"50 ms", 50}, {"100 ms", 100},
+			} {
+				preset := latencyMenu.AddSubMenuItemCheckbox(p.label, "", cfg.LatencyMs == p.ms)
+				pp := p
+				go func() {
+					for range preset.ClickedCh {
+						app.SetLatency(pp.ms)
+						safeRebuild()
+					}
+				}()
+			}
+
 			systray.AddSeparator()
 			startItem := systray.AddMenuItem("Start", "Connect to the server")
 			stopItem := systray.AddMenuItem("Stop", "Disconnect from the server")
@@ -194,6 +217,25 @@ func main() {
 		})
 
 		rebuild()
+
+		// Update the live latency display while connected.
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				rebuildMu.Lock()
+				item := latencyItem
+				rebuildMu.Unlock()
+				if item == nil {
+					continue
+				}
+				if app.Status() == "Connected" {
+					item.SetTitle(fmt.Sprintf("Latency: %.0f ms", app.CurrentLatencyMs()))
+				} else {
+					item.SetTitle("Latency: —")
+				}
+			}
+		}()
 
 		// Refresh the device list and menu when it changes (e.g. the system
 		// default output device changes).

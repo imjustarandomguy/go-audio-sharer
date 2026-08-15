@@ -208,6 +208,20 @@ func (p *Player) Stop() {
 
 func (p *Player) Drain() {}
 
+// LatencyMs returns the approximate current playback latency in milliseconds,
+// derived from how much PCM is currently buffered ahead of the device.
+func (p *Player) LatencyMs() float64 {
+	p.mu.Lock()
+	b := len(p.pending)
+	cfg := p.config
+	p.mu.Unlock()
+	bytesPerSec := cfg.SampleRate * cfg.Channels * (cfg.BitsPerSample / 8)
+	if bytesPerSec <= 0 {
+		return 0
+	}
+	return float64(b) * 1000.0 / float64(bytesPerSec)
+}
+
 func (p *Player) Close() {
 	p.Stop()
 	if p.monitor != nil {

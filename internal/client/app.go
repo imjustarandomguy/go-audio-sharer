@@ -293,6 +293,43 @@ func (a *App) Volume() float64 {
 	return a.cfg.Volume
 }
 
+// Latency returns the configured playback latency in milliseconds.
+func (a *App) Latency() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.cfg.LatencyMs
+}
+
+// SetLatency updates and persists the latency, restarting if running.
+func (a *App) SetLatency(ms int) {
+	if ms < 5 {
+		ms = 5
+	}
+	if ms > 500 {
+		ms = 500
+	}
+	a.mu.Lock()
+	changed := a.cfg.LatencyMs != ms
+	a.cfg.LatencyMs = ms
+	wasRunning := a.running
+	a.mu.Unlock()
+	a.saveConfig()
+	if changed && wasRunning {
+		a.Restart()
+	}
+}
+
+// CurrentLatencyMs returns the player's current buffered latency, or 0 when idle.
+func (a *App) CurrentLatencyMs() float64 {
+	a.mu.Lock()
+	player := a.currentPlayer
+	a.mu.Unlock()
+	if player == nil {
+		return 0
+	}
+	return player.LatencyMs()
+}
+
 // SetVolume updates and persists the playback volume, applying it live.
 func (a *App) SetVolume(v float64) {
 	if v < 0 {
