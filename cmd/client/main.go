@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -47,6 +48,10 @@ func safeRebuild() {
 }
 
 func main() {
+	if f, err := setupLog(); err == nil {
+		defer f.Close()
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatalf("could not load config: %v", err)
@@ -274,6 +279,34 @@ func sameDevices(a, b []audio.DeviceDesc) bool {
 		}
 	}
 	return true
+}
+
+// setupLog mirrors output to a log file in the config directory. This matters
+// on Windows where the GUI build has no console. On Linux/macOS, terminal output
+// is preserved and struct-era log lines are also written to the file.
+func setupLog() (*os.File, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, err
+	}
+	p := filepath.Join(dir, "audio-sharer", "client.log")
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if runtime.GOOS == "windows" {
+		// No console on the GUI build: capture everything to the file.
+		os.Stdout = f
+		os.Stderr = f
+		log.SetOutput(f)
+	} else {
+		log.SetOutput(io.MultiWriter(os.Stderr, f))
+	}
+	log.Printf("========== audio client started ==========")
+	return f, nil
 }
 
 // openConfig opens the client config JSON in the system default editor/text editor.

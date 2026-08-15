@@ -50,13 +50,6 @@ func playbackDevice(ctx malgo.Context, filter string) (*malgo.DeviceInfo, error)
 	return nil, fmt.Errorf("no playback device available")
 }
 
-func deviceName(d *malgo.DeviceInfo) string {
-	if d == nil {
-		return ""
-	}
-	return d.Name()
-}
-
 // listPlaybackDevices returns all playback devices for UI display.
 func listPlaybackDevices(ctx malgo.Context) ([]malgo.DeviceInfo, error) {
 	return ctx.Devices(malgo.Playback)
@@ -80,31 +73,6 @@ func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
 		ctx.Free()
 	}()
 	devs, err := listPlaybackDevices(ctx.Context)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]DeviceDesc, 0, len(devs))
-	for i := range devs {
-		out = append(out, DeviceDesc{
-			Name:      devs[i].Name(),
-			ID:        devs[i].ID.String(),
-			IsDefault: devs[i].IsDefault != 0,
-		})
-	}
-	return out, nil
-}
-
-// ListCaptureDeviceDescriptions returns capture devices for display/debugging.
-func ListCaptureDeviceDescriptions() ([]DeviceDesc, error) {
-	ctx, err := newAudioContextWith([]malgo.Backend{malgo.BackendPulseaudio, malgo.BackendAlsa, malgo.BackendJack})
-	if err != nil {
-		return nil, err
-	}
-	defer func() {
-		_ = ctx.Uninit()
-		ctx.Free()
-	}()
-	devs, err := ctx.Context.Devices(malgo.Capture)
 	if err != nil {
 		return nil, err
 	}

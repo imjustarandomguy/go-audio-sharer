@@ -206,8 +206,6 @@ func (p *Player) Stop() {
 	}
 }
 
-func (p *Player) Drain() {}
-
 // LatencyMs returns the approximate current playback latency in milliseconds,
 // derived from how much PCM is currently buffered ahead of the device.
 func (p *Player) LatencyMs() float64 {
@@ -231,11 +229,6 @@ func (p *Player) Close() {
 		_ = p.ctx.Uninit()
 		p.ctx.Free()
 	}
-}
-
-func (p *Player) RestartCh() <-chan struct{} {
-	ch := make(chan struct{})
-	return ch
 }
 
 // scaleS16 applies a linear volume to little-endian signed-16 samples in place.

@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -60,6 +61,29 @@ func localURL(addr string) string {
 		host = "localhost"
 	}
 	return "http://" + net.JoinHostPort(host, port)
+}
+
+// safeRebuild serializes menu rebuilds (which call systray.ResetMenu) against
+// concurrent callers.
+func safeRebuild(mu *sync.Mutex, fn func()) {
+	mu.Lock()
+	defer mu.Unlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// sameDevices reports whether two device lists are identical by name+default.
+func sameDevices(a, b []audio.DeviceDesc) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Name != b[i].Name || a[i].IsDefault != b[i].IsDefault {
+			return false
+		}
+	}
+	return true
 }
 
 type streamServer struct {
@@ -162,7 +186,6 @@ func main() {
 	bufferMs := flag.Int("buffer-ms", 10, "Buffer size in milliseconds")
 	sampleRate := flag.Int("rate", 48000, "Sample rate")
 	channels := flag.Int("channels", 2, "Number of channels")
-	bits := flag.Int("bits", 16, "Bits per sample")
 	device := flag.String("device", "", "Audio device name to loopback from (optional)")
 	webAddr := flag.String("web-addr", ":8080", "Address for the HTTP/WebSocket web player")
 	noTray := flag.Bool("no-tray", false, "Run headless without a system tray icon")
@@ -183,7 +206,7 @@ func main() {
 	config := audio.Config{
 		SampleRate:    *sampleRate,
 		Channels:      *channels,
-		BitsPerSample: *bits,
+		BitsPerSample: 16,
 		BufferMs:      *bufferMs,
 		Device:        *device,
 	}
@@ -257,6 +280,9 @@ func main() {
 		var statusItem *systray.MenuItem
 		var clientsItem *systray.MenuItem
 
+		var rebuildMu sync.Mutex
+		var rebuild func()
+
 		rebuildClients := func() {
 			if clientsItem == nil {
 				return
@@ -269,7 +295,15 @@ func main() {
 			}
 		}
 
-		rebuild := func() {
+		devs := func() []audio.DeviceDesc {
+			d, err := audio.ListPlaybackDeviceDescriptions()
+			if err != nil {
+				return nil
+			}
+			return d
+		}
+
+		rebuild = func() {
 			systray.ResetMenu()
 			statusItem = systray.AddMenuItem(fmt.Sprintf("Status: Running (%s)", grpcDisplay), "")
 			statusItem.Disable()
@@ -281,6 +315,30 @@ func main() {
 			clientsItem = systray.AddMenuItem("Connected clients: none", "")
 			clientsItem.Disable()
 			rebuildClients()
+
+			devMenu := systray.AddMenuItem("Audio Device", "Choose which output device to loop back, or follow default")
+			autoDev := devMenu.AddSubMenuItemCheckbox("Default (follow)", "", recorder.Device() == "")
+			for _, dev := range devs() {
+				label := dev.Name
+				if dev.IsDefault {
+					label += " (default)"
+				}
+				item := devMenu.AddSubMenuItemCheckbox(label, dev.ID, recorder.Device() == dev.Name)
+				it := item
+				name := dev.Name
+				go func() {
+					for range it.ClickedCh {
+						recorder.SetDevice(name)
+						safeRebuild(&rebuildMu, rebuild)
+					}
+				}()
+			}
+			go func() {
+				for range autoDev.ClickedCh {
+					recorder.SetDevice("")
+					safeRebuild(&rebuildMu, rebuild)
+				}
+			}()
 
 			restartItem := systray.AddMenuItem("Restart", "Restart audio capturing (re-detect device)")
 			systray.AddSeparator()
@@ -312,6 +370,20 @@ func main() {
 			defer ticker.Stop()
 			for range ticker.C {
 				rebuildClients()
+			}
+		}()
+
+		// Refresh the loopback device list when it changes.
+		go func() {
+			var last []audio.DeviceDesc
+			ticker := time.NewTicker(5 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				cur := devs()
+				if !sameDevices(last, cur) {
+					last = cur
+					safeRebuild(&rebuildMu, rebuild)
+				}
 			}
 		}()
 	}

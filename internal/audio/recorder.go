@@ -78,6 +78,31 @@ func (r *Recorder) Restart() {
 	fmt.Println("Recorder restarted")
 }
 
+// SetDevice changes the loopback target device (substring match) and restarts
+// capture if it is currently recording.
+func (r *Recorder) SetDevice(name string) {
+	r.mu.Lock()
+	changed := r.config.Device != name
+	r.config.Device = name
+	wasRecording := r.isRecording
+	r.mu.Unlock()
+
+	if changed {
+		fmt.Printf("Loopback device set to %q\n", name)
+	}
+	if changed && wasRecording {
+		r.stopRecording()
+		r.startRecording()
+	}
+}
+
+// Device returns the currently configured loopback device substring.
+func (r *Recorder) Device() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.config.Device
+}
+
 func (r *Recorder) startRecording() {
 	r.mu.Lock()
 	if r.isRecording {

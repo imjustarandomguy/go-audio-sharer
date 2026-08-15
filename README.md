@@ -10,7 +10,7 @@ A high-performance, low-latency gRPC service to stream system loopback audio to 
 - **Client Auto-Reconnect**: The client reconnects automatically with backoff, and reconnects immediately when the network (or laptop wake) returns.
 - **Network Interface Selection**: The client can bind to a specific LAN interface so it avoids corporate VPN interfaces (like Deskflow).
 - **Cross-Platform Audio (malgo/miniaudio)**: Client selects an output device or automatically follows the OS default output device; server captures system loopback (Linux via the PulseAudio monitor).
-- **Configurable**: Adjustable sample rate, channels, bit depth, and target device.
+- **Configurable**: Adjustable sample rate, channels, buffer, latency, playout volume, and target devices (16-bit PCM).
 
 ## Build
 
@@ -26,13 +26,16 @@ go build -o audio_client cmd/client/main.go
 ./build_windows.sh
 ```
 
-### Build dependencies (Linux)
+### Build dependencies (Arch Linux)
 
-The tray (`systray`) and audio (`malgo`) both need cgo + dev libraries:
+The tray (`systray`) and audio (`malgo`) both need cgo + dev libraries. You also need a C compiler
+(`base-devel`). On Arch:
 
 ```bash
-sudo apt install libgtk-3-dev libayatana-appindicator3-dev libasound2-dev
+sudo pacman -S --needed base-devel gtk3 libayatana-appindicator alsa-lib
 ```
+
+(On Debian/Ubuntu the equivalents are `libgtk-3-dev libayatana-appindicator3-dev libasound2-dev build-essential`.)
 
 ### Windows build and cgo
 
@@ -44,8 +47,8 @@ with a mingw-w64 cross toolchain:
 # On Windows (recommended):
 go build -o audio_client.exe -ldflags "-H windowsgui" ./cmd/client
 
-# Or from Linux with mingw-w64:
-sudo apt install gcc-mingw-w64-x86-64
+# Or cross-compile from Arch with mingw-w64:
+sudo pacman -S --needed mingw-w64-gcc
 CGO_ENABLED=1 GOOS=windows CC=x86_64-w64-mingw32-gcc \
   go build -o audio_client.exe -ldflags "-H windowsgui" ./cmd/client
 ```
@@ -63,15 +66,17 @@ CGO_ENABLED=1 GOOS=windows CC=x86_64-w64-mingw32-gcc \
 | `-buffer-ms`| Capture buffer size in milliseconds                  | `10`     |
 | `-rate`     | Sample rate                                          | `48000`  |
 | `-channels` | Channels                                             | `2`      |
-| `-bits`     | Bits per sample                                      | `16`     |
 | `-web-addr` | Address for the HTTP/WebSocket web player            | `:8080`  |
 | `-no-tray`  | Run headless without a system tray icon              | `false`  |
+
+Audio is always **16-bit PCM** (bits are not configurable).
 
 ### Tray icon
 
 The server shows a tray icon with the active gRPC port and web player address, and:
 - **Connected clients** count and list (updates live),
 - **Open Web Player** (opens the web client at the configured web address),
+- **Audio Device**: choose which output device to loop back, or *Default (follow)* (the device list tracks system changes),
 - **Restart** (re-detect/restart audio capturing),
 - **Quit**.
 
@@ -119,7 +124,7 @@ Settings are kept in a JSON file and edited via the tray (interface) or config f
   "server": "192.168.1.10:50051",
   "interface": "Ethernet",
   "device": "",
-  "latency_ms": 100,
+  "latency_ms": 10,
   "auto_connect": true,
   "volume": 1.0
 }
@@ -131,6 +136,21 @@ picked interface.
 
 `device` is optional; leave it `""` (Default follow) to automatically use and follow the system default
 output device, or set a device name substring to pin playback to a specific audio output.
+
+### Client logs
+
+The client writes a log file (helpful on Windows, which has no console):
+
+- Linux: `~/.config/audio-sharer/client.log`
+- Windows: `%APPDATA%\audio-sharer\client.log`
+
+On Linux/macOS, output also still appears in the terminal when run from one.
+
+## Tests
+
+```bash
+go test ./...
+```
 
 ## Running as a Service (headless server, Linux)
 
