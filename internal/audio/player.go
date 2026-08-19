@@ -16,17 +16,14 @@ type Player struct {
 	device  *malgo.Device
 	monitor *DeviceMonitor
 
-	mu       sync.Mutex
-	pending  []byte
-	volume   float64
-	started  bool
-	config   Config
-	devID    malgo.DeviceID
-	devName  string
-	maxBytes int
+	mu      sync.Mutex
+	pending []byte
+	volume  float64
+	started bool
+	config  Config
+	devID   malgo.DeviceID
+	devName string
 }
-
-const defaultMaxPending = 1 << 19 // ~512KB of buffered PCM
 
 func NewPlayer(cfg Config) (*Player, error) {
 	ctx, err := newAudioContext()
@@ -34,10 +31,9 @@ func NewPlayer(cfg Config) (*Player, error) {
 		return nil, err
 	}
 	p := &Player{
-		ctx:      ctx,
-		config:   cfg,
-		volume:   1.0,
-		maxBytes: defaultMaxPending,
+		ctx:    ctx,
+		config: cfg,
+		volume: 1.0,
 	}
 	p.monitor = newDeviceMonitor(ctx.Context, cfg.Device, func(info *malgo.DeviceInfo) {
 		p.followDefault(info)
@@ -121,12 +117,31 @@ func (p *Player) Start() error {
 func (p *Player) Write(data []byte) error {
 	p.mu.Lock()
 	p.pending = append(p.pending, data...)
-	if len(p.pending) > p.maxBytes {
-		drop := len(p.pending) - p.maxBytes
+	// Bound the buffered latency: if the client receives faster than it plays
+	// (clock drift/jitter), drop the oldest surplus so latency doesn't grow
+	// unboundedly. This matches how the old .NET client stayed low-latency.
+	max := p.maxPendingBytes()
+	if len(p.pending) > max {
+		drop := len(p.pending) - max
 		p.pending = p.pending[drop:]
 	}
 	p.mu.Unlock()
 	return nil
+}
+
+// maxPendingBytes is the target upper bound for buffered PCM, in bytes. It
+// keeps buffered latency at least one device period but never more than a small
+// constant, discarding overflow beyond that.
+func (p *Player) maxPendingBytes() int {
+	bytesPerSec := p.config.SampleRate * p.config.Channels * (p.config.BitsPerSample / 8)
+	if bytesPerSec <= 0 {
+		return 1 << 16
+	}
+	ms := p.config.BufferMs
+	if ms < 50 {
+		ms = 50
+	}
+	return (bytesPerSec * ms) / 1000
 }
 
 // onData is called by miniaudio on its audio thread.

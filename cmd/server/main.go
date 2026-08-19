@@ -274,7 +274,7 @@ func main() {
 	}
 
 	onReady := func() {
-		systray.SetIcon(tray.ServerIcon)
+		systray.SetIcon(tray.ServerIcon())
 		systray.SetTooltip(fmt.Sprintf("Audio Sharer Server (%s)", grpcDisplay))
 
 		var statusItem *systray.MenuItem

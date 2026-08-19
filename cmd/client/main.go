@@ -93,7 +93,7 @@ func main() {
 	}
 
 	onReady := func() {
-		systray.SetIcon(tray.ClientIcon)
+		systray.SetIcon(tray.ClientIcon())
 		systray.SetTooltip("Audio Sharer Client")
 
 		var statusItem *systray.MenuItem
