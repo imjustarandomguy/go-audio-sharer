@@ -167,38 +167,54 @@ func (a *App) streamLoop(ctx context.Context) {
 		}
 		attemptCtx, attemptCancel := context.WithCancel(ctx)
 		errCh := make(chan error, 1)
-		go func() { errCh <- a.connectAndStream(attemptCtx) }()
+		resetBackoffCh := make(chan struct{}, 1)
 
-		select {
-		case <-ctx.Done():
-			attemptCancel()
-			return
-		case <-a.wake:
-			attemptCancel()
-			backoff = minBackoff
-			continue
-		case err := <-errCh:
-			attemptCancel()
-			if err != nil && ctx.Err() != nil {
-				return
-			}
-			a.updateStatus("Reconnecting")
+		go func() {
+			errCh <- a.connectAndStream(attemptCtx, func() {
+				select {
+				case resetBackoffCh <- struct{}{}:
+				default:
+				}
+			})
+		}()
+
+		for {
 			select {
 			case <-ctx.Done():
+				attemptCancel()
 				return
 			case <-a.wake:
+				attemptCancel()
 				backoff = minBackoff
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
+				goto nextAttempt
+			case <-resetBackoffCh:
+				// Reset backoff immediately upon streaming active audio
+				backoff = minBackoff
+			case err := <-errCh:
+				attemptCancel()
+				if err != nil && ctx.Err() != nil {
+					return
+				}
+				a.updateStatus("Reconnecting")
+				select {
+				case <-ctx.Done():
+					return
+				case <-a.wake:
+					backoff = minBackoff
+				case <-time.After(backoff):
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				goto nextAttempt
 			}
 		}
+	nextAttempt:
 	}
 }
 
-func (a *App) connectAndStream(ctx context.Context) error {
+func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	a.mu.Lock()
 	server := a.cfg.Server
 	ifaceName := a.cfg.Interface
@@ -231,7 +247,12 @@ func (a *App) connectAndStream(ctx context.Context) error {
 	defer conn.Close()
 
 	c := pb.NewAudioStreamClient(conn)
-	fmtInfo, err := c.GetFormat(ctx, &emptypb.Empty{})
+
+	// Bound the format handshake with a timeout so a stalled connection
+	// or packet blackhole doesn't hang indefinitely.
+	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, 5*time.Second)
+	fmtInfo, err := c.GetFormat(handshakeCtx, &emptypb.Empty{})
+	handshakeCancel()
 	if err != nil {
 		return err
 	}
@@ -272,6 +293,7 @@ func (a *App) connectAndStream(ctx context.Context) error {
 		return err
 	}
 
+	first := true
 	for {
 		in, rerr := stream.Recv()
 		if rerr != nil {
@@ -279,6 +301,12 @@ func (a *App) connectAndStream(ctx context.Context) error {
 				return rerr
 			}
 			return rerr
+		}
+		if first {
+			first = false
+			if onConnected != nil {
+				onConnected()
+			}
 		}
 		if wErr := p.Write(in.Data); wErr != nil {
 			return wErr

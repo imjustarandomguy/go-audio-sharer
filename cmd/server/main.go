@@ -73,6 +73,26 @@ func safeRebuild(mu *sync.Mutex, fn func()) {
 	}
 }
 
+// onClick binds a menu item click handler that terminates cleanly when ctx is cancelled.
+func onClick(ctx context.Context, item *systray.MenuItem, action func()) {
+	if item == nil {
+		return
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-item.ClickedCh:
+				if !ok {
+					return
+				}
+				action()
+			}
+		}
+	}()
+}
+
 // sameDevices reports whether two device lists are identical by name+default.
 func sameDevices(a, b []audio.DeviceDesc) bool {
 	if len(a) != len(b) {
@@ -282,6 +302,7 @@ func main() {
 
 		var rebuildMu sync.Mutex
 		var rebuild func()
+		var menuCancel context.CancelFunc
 
 		rebuildClients := func() {
 			if clientsItem == nil {
@@ -304,6 +325,12 @@ func main() {
 		}
 
 		rebuild = func() {
+			if menuCancel != nil {
+				menuCancel()
+			}
+			var menuCtx context.Context
+			menuCtx, menuCancel = context.WithCancel(context.Background())
+
 			systray.ResetMenu()
 			statusItem = systray.AddMenuItem(fmt.Sprintf("Status: Running (%s)", grpcDisplay), "")
 			statusItem.Disable()
@@ -324,43 +351,35 @@ func main() {
 					label += " (default)"
 				}
 				item := devMenu.AddSubMenuItemCheckbox(label, dev.ID, recorder.Device() == dev.Name)
-				it := item
 				name := dev.Name
-				go func() {
-					for range it.ClickedCh {
-						recorder.SetDevice(name)
-						safeRebuild(&rebuildMu, rebuild)
-					}
-				}()
-			}
-			go func() {
-				for range autoDev.ClickedCh {
-					recorder.SetDevice("")
+				onClick(menuCtx, item, func() {
+					recorder.SetDevice(name)
 					safeRebuild(&rebuildMu, rebuild)
-				}
-			}()
+				})
+			}
+			onClick(menuCtx, autoDev, func() {
+				recorder.SetDevice("")
+				safeRebuild(&rebuildMu, rebuild)
+			})
 
 			restartItem := systray.AddMenuItem("Restart", "Restart audio capturing (re-detect device)")
 			systray.AddSeparator()
 			quitItem := systray.AddMenuItem("Quit", "Stop the server")
 
-			go func() {
-				for range webItem.ClickedCh {
-					_ = execCommand(webURL)
+			onClick(menuCtx, webItem, func() {
+				_ = execCommand(webURL)
+			})
+			onClick(menuCtx, restartItem, func() {
+				ss.restart()
+				statusItem.SetTitle(fmt.Sprintf("Status: Running (%s)", grpcDisplay))
+				rebuildClients()
+			})
+			onClick(menuCtx, quitItem, func() {
+				if menuCancel != nil {
+					menuCancel()
 				}
-			}()
-			go func() {
-				for range restartItem.ClickedCh {
-					ss.restart()
-					statusItem.SetTitle(fmt.Sprintf("Status: Running (%s)", grpcDisplay))
-					rebuildClients()
-				}
-			}()
-			go func() {
-				for range quitItem.ClickedCh {
-					systray.Quit()
-				}
-			}()
+				systray.Quit()
+			})
 		}
 
 		rebuild()

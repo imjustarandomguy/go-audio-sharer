@@ -54,3 +54,45 @@ func TestNewDialer(t *testing.T) {
 		t.Error("NewDialer without ip should leave LocalAddr nil")
 	}
 }
+
+func TestFindInterface(t *testing.T) {
+	ifaces := Interfaces()
+	if len(ifaces) == 0 {
+		t.Skip("no network interfaces available on host")
+	}
+	first := ifaces[0]
+
+	// Exact match
+	if found, ok := FindInterface(first.Name); !ok || found.Name != first.Name {
+		t.Errorf("exact match failed: got %v, %v; want %s", found, ok, first.Name)
+	}
+
+	// Case-insensitive match
+	upper := first.Name
+	if len(upper) > 0 {
+		upper = string(upper[0]-32) + upper[1:] // simple case shift if letter
+	}
+	if found, ok := FindInterface(upper); !ok || found.Name != first.Name {
+		t.Errorf("case-insensitive match failed: got %v, %v; want %s", found, ok, first.Name)
+	}
+
+	// Substring match (first 2 chars if long enough)
+	if len(first.Name) >= 3 {
+		sub := first.Name[:2]
+		if found, ok := FindInterface(sub); !ok {
+			t.Errorf("substring match failed for %q", sub)
+		} else if found.Name == "" {
+			t.Errorf("expected non-empty interface name")
+		}
+	}
+
+	// Non-existent interface
+	if _, ok := FindInterface("non_existent_iface_9999"); ok {
+		t.Errorf("expected false for nonexistent interface")
+	}
+
+	// Empty string
+	if _, ok := FindInterface(""); ok {
+		t.Errorf("expected false for empty string")
+	}
+}

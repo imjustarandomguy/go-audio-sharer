@@ -3,6 +3,7 @@ package netutil
 import (
 	"fmt"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -49,9 +50,25 @@ func Interfaces() []Interface {
 }
 
 // FindInterface returns the interface matching name (case-insensitive substring match).
+// It prefers an exact case-insensitive match, and falls back to a substring match.
 func FindInterface(name string) (Interface, bool) {
-	for _, iface := range Interfaces() {
-		if iface.Name == name {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return Interface{}, false
+	}
+	lower := strings.ToLower(name)
+	ifaces := Interfaces()
+
+	// Pass 1: exact match (case-insensitive)
+	for _, iface := range ifaces {
+		if strings.ToLower(iface.Name) == lower {
+			return iface, true
+		}
+	}
+
+	// Pass 2: substring match (case-insensitive)
+	for _, iface := range ifaces {
+		if strings.Contains(strings.ToLower(iface.Name), lower) {
 			return iface, true
 		}
 	}

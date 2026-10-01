@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -22,6 +23,26 @@ import (
 	"go-audio-sharer/internal/netutil"
 	"go-audio-sharer/internal/tray"
 )
+
+// onClick binds a menu item click handler that terminates cleanly when ctx is cancelled.
+func onClick(ctx context.Context, item *systray.MenuItem, action func()) {
+	if item == nil {
+		return
+	}
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case _, ok := <-item.ClickedCh:
+				if !ok {
+					return
+				}
+				action()
+			}
+		}
+	}()
+}
 
 // devState caches the latest playback device list (refreshed periodically).
 var devState struct {
@@ -98,8 +119,15 @@ func main() {
 
 		var statusItem *systray.MenuItem
 		var latencyItem *systray.MenuItem
+		var menuCancel context.CancelFunc
 
 		rebuild = func() {
+			if menuCancel != nil {
+				menuCancel()
+			}
+			var menuCtx context.Context
+			menuCtx, menuCancel = context.WithCancel(context.Background())
+
 			systray.ResetMenu()
 
 			statusItem = systray.AddMenuItem("Status: "+app.Status(), "")
@@ -114,40 +142,31 @@ func main() {
 			addrItem := serverItem.AddSubMenuItem(cfg.Server, "")
 			addrItem.Disable()
 			openCfgItem := serverItem.AddSubMenuItem("Open config file…", "Edit the server address in the config JSON")
-			go func() {
-				for range openCfgItem.ClickedCh {
-					_ = openConfig()
-				}
-			}()
+			onClick(menuCtx, openCfgItem, func() {
+				_ = openConfig()
+			})
 			reloadCfgItem := serverItem.AddSubMenuItem("Reload config", "Re-read config from disk and reconnect")
-			go func() {
-				for range reloadCfgItem.ClickedCh {
-					app.Reload()
-					app.Restart()
-					safeRebuild()
-				}
-			}()
+			onClick(menuCtx, reloadCfgItem, func() {
+				app.Reload()
+				app.Restart()
+				safeRebuild()
+			})
 
 			ifaceMenu := systray.AddMenuItem("Network Interface", "Choose LAN interface to route around a VPN")
 			autoItem := ifaceMenu.AddSubMenuItemCheckbox("Automatic (default)", "", cfg.Interface == "")
 			for _, iface := range netutil.Interfaces() {
 				item := ifaceMenu.AddSubMenuItemCheckbox(
 					iface.Name+" ("+iface.IP.String()+")", "", cfg.Interface == iface.Name)
-				it := item
 				name := iface.Name
-				go func() {
-					for range it.ClickedCh {
-						app.SetInterface(name)
-						safeRebuild()
-					}
-				}()
-			}
-			go func() {
-				for range autoItem.ClickedCh {
-					app.SetInterface("")
+				onClick(menuCtx, item, func() {
+					app.SetInterface(name)
 					safeRebuild()
-				}
-			}()
+				})
+			}
+			onClick(menuCtx, autoItem, func() {
+				app.SetInterface("")
+				safeRebuild()
+			})
 
 			devMenu := systray.AddMenuItem("Audio Device", "Choose an output device, or follow the system default")
 			autoDev := devMenu.AddSubMenuItemCheckbox("Default (follow)", "", cfg.Device == "")
@@ -157,21 +176,16 @@ func main() {
 					label += " (default)"
 				}
 				item := devMenu.AddSubMenuItemCheckbox(label, dev.ID, cfg.Device == dev.Name)
-				it := item
 				name := dev.Name
-				go func() {
-					for range it.ClickedCh {
-						app.SetDevice(name)
-						safeRebuild()
-					}
-				}()
-			}
-			go func() {
-				for range autoDev.ClickedCh {
-					app.SetDevice("")
+				onClick(menuCtx, item, func() {
+					app.SetDevice(name)
 					safeRebuild()
-				}
-			}()
+				})
+			}
+			onClick(menuCtx, autoDev, func() {
+				app.SetDevice("")
+				safeRebuild()
+			})
 
 			volMenu := systray.AddMenuItem("Volume", "Playback volume")
 			for _, p := range []struct {
@@ -182,12 +196,10 @@ func main() {
 			} {
 				preset := volMenu.AddSubMenuItemCheckbox(p.label, "", cfg.Volume == p.v)
 				pp := p
-				go func() {
-					for range preset.ClickedCh {
-						app.SetVolume(pp.v)
-						safeRebuild()
-					}
-				}()
+				onClick(menuCtx, preset, func() {
+					app.SetVolume(pp.v)
+					safeRebuild()
+				})
 			}
 
 			latencyMenu := systray.AddMenuItem("Latency", "Set target playback latency")
@@ -200,12 +212,10 @@ func main() {
 			} {
 				preset := latencyMenu.AddSubMenuItemCheckbox(p.label, "", cfg.LatencyMs == p.ms)
 				pp := p
-				go func() {
-					for range preset.ClickedCh {
-						app.SetLatency(pp.ms)
-						safeRebuild()
-					}
-				}()
+				onClick(menuCtx, preset, func() {
+					app.SetLatency(pp.ms)
+					safeRebuild()
+				})
 			}
 
 			systray.AddSeparator()
@@ -215,30 +225,25 @@ func main() {
 			systray.AddSeparator()
 			quitItem := systray.AddMenuItem("Exit", "Quit")
 
-			go func() {
-				for range startItem.ClickedCh {
-					app.Start()
-					safeRebuild()
+			onClick(menuCtx, startItem, func() {
+				app.Start()
+				safeRebuild()
+			})
+			onClick(menuCtx, stopItem, func() {
+				app.Stop()
+				safeRebuild()
+			})
+			onClick(menuCtx, restartItem, func() {
+				app.Restart()
+				safeRebuild()
+			})
+			onClick(menuCtx, quitItem, func() {
+				if menuCancel != nil {
+					menuCancel()
 				}
-			}()
-			go func() {
-				for range stopItem.ClickedCh {
-					app.Stop()
-					safeRebuild()
-				}
-			}()
-			go func() {
-				for range restartItem.ClickedCh {
-					app.Restart()
-					safeRebuild()
-				}
-			}()
-			go func() {
-				for range quitItem.ClickedCh {
-					app.Stop()
-					systray.Quit()
-				}
-			}()
+				app.Stop()
+				systray.Quit()
+			})
 		}
 
 		app.SetStatusCallback(func() {

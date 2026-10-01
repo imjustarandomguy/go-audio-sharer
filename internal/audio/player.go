@@ -17,7 +17,7 @@ type Player struct {
 	monitor *DeviceMonitor
 
 	mu      sync.Mutex
-	pending []byte
+	ring    *byteRingBuffer
 	volume  float64
 	started bool
 	config  Config
@@ -34,6 +34,7 @@ func NewPlayer(cfg Config) (*Player, error) {
 		ctx:    ctx,
 		config: cfg,
 		volume: 1.0,
+		ring:   newByteRingBuffer(512 * 1024), // 512 KB (~2.7s headroom at 48kHz stereo)
 	}
 	p.monitor = newDeviceMonitor(ctx.Context, cfg.Device, func(info *malgo.DeviceInfo) {
 		p.followDefault(info)
@@ -116,16 +117,27 @@ func (p *Player) Start() error {
 
 func (p *Player) Write(data []byte) error {
 	p.mu.Lock()
-	p.pending = append(p.pending, data...)
-	// Bound the buffered latency: if the client receives faster than it plays
-	// (clock drift/jitter), drop the oldest surplus so latency doesn't grow
-	// unboundedly. This matches how the old .NET client stayed low-latency.
-	max := p.maxPendingBytes()
-	if len(p.pending) > max {
-		drop := len(p.pending) - max
-		p.pending = p.pending[drop:]
+	defer p.mu.Unlock()
+
+	frameBytes := p.config.Channels * (p.config.BitsPerSample / 8)
+	if frameBytes <= 0 {
+		frameBytes = 2
 	}
-	p.mu.Unlock()
+
+	max := p.maxPendingBytes()
+	total := p.ring.Len() + len(data)
+	if total > max {
+		drop := total - max
+		// Align drop up to the next frame boundary so that the remaining buffer
+		// stays <= max and frame alignment is strictly maintained (preventing
+		// left/right channel flips or byte-shift distortion).
+		if rem := drop % frameBytes; rem != 0 {
+			drop += frameBytes - rem
+		}
+		p.ring.Discard(drop)
+	}
+
+	p.ring.Write(data)
 	return nil
 }
 
@@ -133,7 +145,11 @@ func (p *Player) Write(data []byte) error {
 // keeps buffered latency at least one device period but never more than a small
 // constant, discarding overflow beyond that.
 func (p *Player) maxPendingBytes() int {
-	bytesPerSec := p.config.SampleRate * p.config.Channels * (p.config.BitsPerSample / 8)
+	frameBytes := p.config.Channels * (p.config.BitsPerSample / 8)
+	if frameBytes <= 0 {
+		frameBytes = 2
+	}
+	bytesPerSec := p.config.SampleRate * frameBytes
 	if bytesPerSec <= 0 {
 		return 1 << 16
 	}
@@ -141,14 +157,15 @@ func (p *Player) maxPendingBytes() int {
 	if ms < 50 {
 		ms = 50
 	}
-	return (bytesPerSec * ms) / 1000
+	raw := (bytesPerSec * ms) / 1000
+	return (raw / frameBytes) * frameBytes
 }
 
 // onData is called by miniaudio on its audio thread.
 func (p *Player) onData(out, _ []byte, framecount uint32) {
+	n := p.ring.Read(out)
+
 	p.mu.Lock()
-	n := copy(out, p.pending)
-	p.pending = p.pending[n:]
 	vol := p.volume
 	p.mu.Unlock()
 
@@ -171,10 +188,11 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 	p.started = false
 	old := p.device
 	p.device = nil
-	p.pending = p.pending[:0]
 	p.devID = info.ID
 	p.devName = info.Name()
 	p.mu.Unlock()
+
+	p.ring.Reset()
 
 	if old != nil {
 		_ = old.Stop()
@@ -212,8 +230,9 @@ func (p *Player) Stop() {
 	p.started = false
 	dev := p.device
 	p.device = nil
-	p.pending = p.pending[:0]
 	p.mu.Unlock()
+
+	p.ring.Reset()
 
 	if dev != nil {
 		_ = dev.Stop()
@@ -224,8 +243,8 @@ func (p *Player) Stop() {
 // LatencyMs returns the approximate current playback latency in milliseconds,
 // derived from how much PCM is currently buffered ahead of the device.
 func (p *Player) LatencyMs() float64 {
+	b := p.ring.Len()
 	p.mu.Lock()
-	b := len(p.pending)
 	cfg := p.config
 	p.mu.Unlock()
 	bytesPerSec := cfg.SampleRate * cfg.Channels * (cfg.BitsPerSample / 8)

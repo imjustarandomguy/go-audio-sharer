@@ -128,7 +128,8 @@ btn.onclick = async function() {
     return;
   }
 
-  ctx = new AudioContext();
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  ctx = new AudioCtx();
   audioEl = new Audio();
   audioEl.autoplay = true;
 
@@ -156,7 +157,8 @@ btn.onclick = async function() {
     } catch(e) { /* ignore */ }
   }
 
-  ws = new WebSocket('ws://' + location.host + '/ws');
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws');
   ws.binaryType = 'arraybuffer';
 
   ws.onopen = function() {
@@ -175,6 +177,13 @@ btn.onclick = async function() {
       const fmt = JSON.parse(e.data);
       setStatus(fmt.sampleRate + ' Hz \u00b7 ' + fmt.channels + ' ch', 'connected');
 
+      // If AudioContext sample rate doesn't match stream, recreate it with the correct rate.
+      if (ctx.sampleRate !== fmt.sampleRate) {
+        try { await ctx.close(); } catch(err) {}
+        ctx = new AudioCtx({ sampleRate: fmt.sampleRate });
+        processorRegistered = false;
+      }
+
       if (processorRegistered) {
         node = new AudioWorkletNode(ctx, 'audio-sharer-processor', {
           outputChannelCount: [fmt.channels]
@@ -186,12 +195,23 @@ btn.onclick = async function() {
         return;
       }
 
+      const maxQueueBytes = Math.max(fmt.sampleRate * fmt.channels * 2 * 0.1, 4096); // 100ms buffer bound
       const code = [
         'class P extends AudioWorkletProcessor {',
         '  constructor() {',
         '    super();',
         '    this.q = [];',
-        '    this.port.onmessage = (e) => this.q.push(new Int16Array(e.data));',
+        '    this.curBytes = 0;',
+        '    this.maxQueueBytes = ' + maxQueueBytes + ';',
+        '    this.port.onmessage = (e) => {',
+        '      const src = new Int16Array(e.data);',
+        '      this.q.push(src);',
+        '      this.curBytes += src.byteLength;',
+        '      while (this.curBytes > this.maxQueueBytes && this.q.length > 1) {',
+        '        const dropped = this.q.shift();',
+        '        this.curBytes -= dropped.byteLength;',
+        '      }',
+        '    };',
         '  }',
         '  process(inputs, outputs) {',
         '    const out = outputs[0];',
@@ -212,8 +232,9 @@ btn.onclick = async function() {
         '      }',
         '      if (take < frames) {',
         '        this.q[0] = src.slice(take * ch);',
+        '        this.curBytes -= take * ch * 2;',
         '      } else {',
-        '        this.q.shift();',
+        '        this.curBytes -= this.q.shift().byteLength;',
         '      }',
         '      fill += take;',
         '    }',

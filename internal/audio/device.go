@@ -62,17 +62,56 @@ type DeviceDesc struct {
 	IsDefault bool
 }
 
-// ListPlaybackDeviceDescriptions returns the playback devices for display.
-func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
-	ctx, err := newAudioContext()
+var (
+	discoveryMu  sync.Mutex
+	discoveryCtx *malgo.AllocatedContext
+)
+
+func getDiscoveryContext() (*malgo.AllocatedContext, error) {
+	discoveryMu.Lock()
+	defer discoveryMu.Unlock()
+	if discoveryCtx != nil {
+		return discoveryCtx, nil
+	}
+	c, err := newAudioContext()
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_ = ctx.Uninit()
-		ctx.Free()
-	}()
-	devs, err := listPlaybackDevices(ctx.Context)
+	discoveryCtx = c
+	return discoveryCtx, nil
+}
+
+// ListPlaybackDeviceDescriptions returns the playback devices for display.
+// It reuses a shared discovery audio context to avoid re-initializing the OS
+// audio driver on every poll.
+func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
+	c, err := getDiscoveryContext()
+	if err != nil {
+		return nil, err
+	}
+	desc, err := ListPlaybackDeviceDescriptionsWith(c.Context)
+	if err != nil {
+		// If querying failed (e.g. audio server restarted), invalidate and retry once.
+		discoveryMu.Lock()
+		if discoveryCtx == c {
+			_ = discoveryCtx.Uninit()
+			discoveryCtx.Free()
+			discoveryCtx = nil
+		}
+		discoveryMu.Unlock()
+
+		c2, err2 := getDiscoveryContext()
+		if err2 != nil {
+			return nil, err2
+		}
+		return ListPlaybackDeviceDescriptionsWith(c2.Context)
+	}
+	return desc, nil
+}
+
+// ListPlaybackDeviceDescriptionsWith returns playback devices from an existing context.
+func ListPlaybackDeviceDescriptionsWith(ctx malgo.Context) ([]DeviceDesc, error) {
+	devs, err := listPlaybackDevices(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +163,7 @@ type DeviceMonitor struct {
 	onChange func(info *malgo.DeviceInfo)
 	stopCh   chan struct{}
 	done     chan struct{}
+	once     sync.Once
 }
 
 func newDeviceMonitor(ctx malgo.Context, filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
@@ -176,11 +216,13 @@ func (dm *DeviceMonitor) setCurrent(id string) {
 }
 
 func (dm *DeviceMonitor) close() {
-	select {
-	case <-dm.done:
-		return
-	default:
-	}
-	close(dm.stopCh)
-	<-dm.done
+	dm.once.Do(func() {
+		select {
+		case <-dm.done:
+			return
+		default:
+		}
+		close(dm.stopCh)
+		<-dm.done
+	})
 }

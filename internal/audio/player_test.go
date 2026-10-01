@@ -59,3 +59,54 @@ func TestScaleS16Mute(t *testing.T) {
 		t.Error("volume 0 should zero all samples")
 	}
 }
+
+func TestPlayerWriteFrameAlignment(t *testing.T) {
+	// 48kHz, 2 channels (stereo), 16-bit PCM = 4 bytes per frame.
+	cfg := Config{
+		SampleRate:    48000,
+		Channels:      2,
+		BitsPerSample: 16,
+		BufferMs:      50, // min buffer ms = 50 -> 48000 * 4 * 0.05 = 9600 bytes
+	}
+	p := &Player{
+		config: cfg,
+		volume: 1.0,
+		ring:   newByteRingBuffer(16384),
+	}
+
+	frameBytes := cfg.Channels * (cfg.BitsPerSample / 8)
+	// Write distinct identifiable stereo frames: L=1000, R=2000
+	makeStereoFrame := func(l, r int16) []byte {
+		b := make([]byte, 4)
+		binary.LittleEndian.PutUint16(b[0:2], uint16(l))
+		binary.LittleEndian.PutUint16(b[2:4], uint16(r))
+		return b
+	}
+
+	// Write more than maxPendingBytes so it triggers surplus drop
+	frame := makeStereoFrame(1000, -2000)
+	buf := make([]byte, 0, 12000)
+	for i := 0; i < 3000; i++ {
+		buf = append(buf, frame...)
+	}
+
+	if err := p.Write(buf); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	// Check that buffered bytes count is an exact multiple of frameBytes
+	if p.ring.Len()%frameBytes != 0 {
+		t.Errorf("buffered bytes %d is not a multiple of frame size %d", p.ring.Len(), frameBytes)
+	}
+
+	// Read out a frame and verify that L is 1000 and R is -2000 (not byte shifted or channel swapped)
+	out := make([]byte, 4)
+	p.onData(out, nil, 1)
+
+	gotL := SampleAsInt16(out[0:2])
+	gotR := SampleAsInt16(out[2:4])
+	if gotL != 1000 || gotR != -2000 {
+		t.Fatalf("frame corrupted after drop: got L=%d, R=%d, want L=1000, R=-2000", gotL, gotR)
+	}
+}
+
