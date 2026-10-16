@@ -174,11 +174,7 @@ func newDeviceMonitor(ctx malgo.Context, filter string, onChange func(*malgo.Dev
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
 	}
-	if filter == "" {
-		go dm.run()
-	} else {
-		close(dm.done)
-	}
+	go dm.run()
 	return dm
 }
 
@@ -191,20 +187,40 @@ func (dm *DeviceMonitor) run() {
 		case <-dm.stopCh:
 			return
 		case <-t.C:
-			info, err := playbackDevice(dm.ctx, dm.filter)
+			dm.mu.Lock()
+			filter := dm.filter
+			dm.mu.Unlock()
+			if filter != "" {
+				continue
+			}
+			info, err := playbackDevice(dm.ctx, "")
 			if err != nil {
 				continue
 			}
 			id := info.ID.String()
 			dm.mu.Lock()
-			changed := dm.current != "" && id != dm.current
-			dm.current = id
+			// Re-check filter under lock in case setFilter was called concurrently.
+			changed := dm.filter == "" && dm.current != "" && id != dm.current
+			if dm.filter == "" {
+				dm.current = id
+			}
 			dm.mu.Unlock()
 			if changed && dm.onChange != nil {
 				dm.onChange(info)
 			}
 		}
 	}
+}
+
+// setFilter updates the device filter. When empty, the monitor follows default
+// device changes; when non-empty, default-device polling is paused.
+func (dm *DeviceMonitor) setFilter(filter string) {
+	dm.mu.Lock()
+	dm.filter = filter
+	if filter != "" {
+		dm.current = ""
+	}
+	dm.mu.Unlock()
 }
 
 // setCurrent seeds the monitored device id (used right after opening a device)

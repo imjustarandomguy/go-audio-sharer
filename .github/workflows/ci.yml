@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install C dependencies and MinGW cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            gcc-mingw-w64-x86-64
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run unit tests with race detector
+        run: go test -race -v ./...
+
+      - name: Build Linux server and client
+        run: |
+          go build -o audio_server ./cmd/server
+          go build -o audio_client ./cmd/client
+
+      - name: Cross-compile Windows client
+        run: ./build_windows.sh

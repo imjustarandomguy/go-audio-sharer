@@ -25,7 +25,13 @@ func TestBroadcasterLifecycle(t *testing.T) {
 	)
 
 	// First subscriber triggers onStart
+	if b.HasSubscribers() {
+		t.Fatal("expected HasSubscribers() == false initially")
+	}
 	ch1 := b.SubscribeWithChan()
+	if !b.HasSubscribers() {
+		t.Fatal("expected HasSubscribers() == true after subscribe")
+	}
 	startWg.Wait()
 	if started.Load() != 1 {
 		t.Fatalf("onStart count = %d, want 1", started.Load())
@@ -68,6 +74,9 @@ func TestBroadcasterLifecycle(t *testing.T) {
 
 	// Unsubscribe second: onStop triggers
 	b.UnsubscribeWithChan(ch2)
+	if b.HasSubscribers() {
+		t.Fatal("expected HasSubscribers() == false after last unsubscribe")
+	}
 	stopWg.Wait()
 	if stopped.Load() != 1 {
 		t.Fatalf("onStop count = %d, want 1", stopped.Load())

@@ -1,3 +1,4 @@
 audio_client
 audio_server
 *.exe
+.crush/

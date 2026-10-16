@@ -3,6 +3,7 @@ package audio
 import (
 	"encoding/binary"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/gen2brain/malgo"
@@ -16,6 +17,7 @@ type Player struct {
 	device  *malgo.Device
 	monitor *DeviceMonitor
 
+	opMu    sync.Mutex
 	mu      sync.Mutex
 	ring    *byteRingBuffer
 	volume  float64
@@ -54,7 +56,7 @@ func (p *Player) SetVolume(v float64) {
 	p.mu.Unlock()
 }
 
-// createDeviceLocked initializes the playback device for the currently chosen
+// createDevice initializes the playback device for the currently chosen
 // output. Caller must not hold p.mu around device.Stop/Uninit calls.
 func (p *Player) createDevice() (*malgo.Device, error) {
 	info, err := playbackDevice(p.ctx.Context, p.config.Device)
@@ -66,7 +68,7 @@ func (p *Player) createDevice() (*malgo.Device, error) {
 	p.devID = info.ID
 	p.devName = info.Name()
 	p.mu.Unlock()
-	fmt.Printf("Playback device: %s\n", info.Name())
+	log.Printf("Playback device: %s", info.Name())
 	if p.monitor != nil {
 		p.monitor.setCurrent(info.ID.String())
 	}
@@ -92,6 +94,9 @@ func (p *Player) createDevice() (*malgo.Device, error) {
 }
 
 func (p *Player) Start() error {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+
 	p.mu.Lock()
 	if p.started {
 		p.mu.Unlock()
@@ -180,6 +185,9 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 
 // followDefault re-creates the playback device when the default output changes.
 func (p *Player) followDefault(info *malgo.DeviceInfo) {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
@@ -201,27 +209,25 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 
 	dev, err := p.createDevice()
 	if err != nil {
-		fmt.Printf("Error reopening device after change: %v\n", err)
+		log.Printf("Error reopening device after change: %v", err)
 		return
 	}
 	if err := dev.Start(); err != nil {
-		fmt.Printf("Error starting device after change: %v\n", err)
+		log.Printf("Error starting device after change: %v", err)
 		dev.Uninit()
 		return
 	}
 
 	p.mu.Lock()
-	if p.started {
-		_ = dev.Stop()
-		dev.Uninit()
-	} else {
-		p.device = dev
-		p.started = true
-	}
+	p.device = dev
+	p.started = true
 	p.mu.Unlock()
 }
 
 func (p *Player) Stop() {
+	p.opMu.Lock()
+	defer p.opMu.Unlock()
+
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
@@ -255,10 +261,10 @@ func (p *Player) LatencyMs() float64 {
 }
 
 func (p *Player) Close() {
-	p.Stop()
 	if p.monitor != nil {
 		p.monitor.close()
 	}
+	p.Stop()
 	if p.ctx != nil {
 		_ = p.ctx.Uninit()
 		p.ctx.Free()

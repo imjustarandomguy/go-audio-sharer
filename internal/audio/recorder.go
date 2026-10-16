@@ -1,7 +1,7 @@
 package audio
 
 import (
-	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -22,6 +22,7 @@ type Recorder struct {
 	broadcaster *Broadcaster
 	config      Config
 	monitor     *DeviceMonitor
+	opMu        sync.Mutex
 	mu          sync.Mutex
 	isRecording bool
 	captureID   malgo.DeviceID
@@ -52,13 +53,16 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 
 // handleDeviceChange is called when the default audio device changes.
 func (r *Recorder) handleDeviceChange(info *malgo.DeviceInfo) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
 	r.mu.Lock()
 	wasRecording := r.isRecording
 	r.mu.Unlock()
 	if wasRecording {
-		fmt.Println("Default device changed, restarting capture...")
-		r.stopRecording()
-		r.startRecording()
+		log.Println("Default device changed, restarting capture...")
+		r.stopRecordingLocked()
+		r.startRecordingLocked()
 	}
 }
 
@@ -70,29 +74,41 @@ func (r *Recorder) Unsubscribe(ch chan CapturedBlock) {
 	r.broadcaster.UnsubscribeWithChan(ch)
 }
 
-// Restart stops and restarts capturing so the target device is re-detected.
+// Restart stops and restarts capturing (when clients are connected) so the
+// target device is re-detected.
 func (r *Recorder) Restart() {
-	r.stopRecording()
-	time.Sleep(200 * time.Millisecond)
-	r.startRecording()
-	fmt.Println("Recorder restarted")
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
+	r.stopRecordingLocked()
+	if r.broadcaster.HasSubscribers() {
+		time.Sleep(200 * time.Millisecond)
+		r.startRecordingLocked()
+	}
+	log.Println("Recorder restarted")
 }
 
 // SetDevice changes the loopback target device (substring match) and restarts
 // capture if it is currently recording.
 func (r *Recorder) SetDevice(name string) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
 	r.mu.Lock()
 	changed := r.config.Device != name
 	r.config.Device = name
 	wasRecording := r.isRecording
 	r.mu.Unlock()
 
-	if changed {
-		fmt.Printf("Loopback device set to %q\n", name)
+	if r.monitor != nil {
+		r.monitor.setFilter(name)
 	}
-	if changed && wasRecording {
-		r.stopRecording()
-		r.startRecording()
+	if changed {
+		log.Printf("Loopback device set to %q", name)
+	}
+	if changed && (wasRecording || r.broadcaster.HasSubscribers()) {
+		r.stopRecordingLocked()
+		r.startRecordingLocked()
 	}
 }
 
@@ -104,18 +120,25 @@ func (r *Recorder) Device() string {
 }
 
 func (r *Recorder) startRecording() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.startRecordingLocked()
+}
+
+func (r *Recorder) startRecordingLocked() {
 	r.mu.Lock()
 	if r.isRecording {
 		r.mu.Unlock()
 		return
 	}
+	devFilter := r.config.Device
 	r.mu.Unlock()
 
 	// The monitor tracks the playback (sink) device; find it so we can seed its
 	// current id correctly.
-	play, err := playbackDevice(r.client.Context, r.config.Device)
+	play, err := playbackDevice(r.client.Context, devFilter)
 	if err != nil {
-		fmt.Printf("Error selecting output to loop back: %v\n", err)
+		log.Printf("Error selecting output to loop back: %v", err)
 		return
 	}
 	if r.monitor != nil {
@@ -123,15 +146,15 @@ func (r *Recorder) startRecording() {
 	}
 
 	// Capture the monitor of the chosen/current default output device.
-	info, err := loopbackCaptureDevice(r.client.Context, r.config.Device)
+	info, err := loopbackCaptureDevice(r.client.Context, devFilter)
 	if err != nil {
-		fmt.Printf("Error selecting monitor to loop back: %v\n", err)
+		log.Printf("Error selecting monitor to loop back: %v", err)
 		return
 	}
 	r.mu.Lock()
 	r.captureID = info.ID
 	r.mu.Unlock()
-	fmt.Printf("Looping back output monitor: %s\n", info.Name())
+	log.Printf("Looping back output monitor: %s", info.Name())
 
 	dc := malgo.DefaultDeviceConfig(malgo.Capture)
 	dc.Capture.Format = malgo.FormatS16
@@ -143,11 +166,11 @@ func (r *Recorder) startRecording() {
 
 	stream, err := malgo.InitDevice(r.client.Context, dc, malgo.DeviceCallbacks{Data: r.onData})
 	if err != nil {
-		fmt.Printf("Error creating loopback capture: %v\n", err)
+		log.Printf("Error creating loopback capture: %v", err)
 		return
 	}
 	if err := stream.Start(); err != nil {
-		fmt.Printf("Error starting loopback capture: %v\n", err)
+		log.Printf("Error starting loopback capture: %v", err)
 		stream.Uninit()
 		return
 	}
@@ -156,7 +179,7 @@ func (r *Recorder) startRecording() {
 	r.stream = stream
 	r.isRecording = true
 	r.mu.Unlock()
-	fmt.Println("Started loopback capture")
+	log.Println("Started loopback capture")
 }
 
 func (r *Recorder) onData(_, in []byte, framecount uint32) {
@@ -172,6 +195,12 @@ func (r *Recorder) onData(_, in []byte, framecount uint32) {
 }
 
 func (r *Recorder) stopRecording() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.stopRecordingLocked()
+}
+
+func (r *Recorder) stopRecordingLocked() {
 	r.mu.Lock()
 	r.isRecording = false
 	stream := r.stream
@@ -181,15 +210,15 @@ func (r *Recorder) stopRecording() {
 	if stream != nil {
 		_ = stream.Stop()
 		stream.Uninit()
-		fmt.Println("Stopped loopback capture")
+		log.Println("Stopped loopback capture")
 	}
 }
 
 func (r *Recorder) Close() {
-	r.stopRecording()
 	if r.monitor != nil {
 		r.monitor.close()
 	}
+	r.stopRecording()
 	if r.client != nil {
 		_ = r.client.Uninit()
 		r.client.Free()

@@ -37,4 +37,13 @@ func TestDeviceMonitorSetCurrent(t *testing.T) {
 	if cur != "device-123" {
 		t.Fatalf("current = %q, want 'device-123'", cur)
 	}
+
+	dm.setFilter("HDMI")
+	dm.mu.Lock()
+	f := dm.filter
+	cur = dm.current
+	dm.mu.Unlock()
+	if f != "HDMI" || cur != "" {
+		t.Fatalf("after setFilter('HDMI'), filter=%q current=%q, want 'HDMI' and ''", f, cur)
+	}
 }

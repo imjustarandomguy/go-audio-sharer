@@ -1,0 +1,49 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install C dependencies and MinGW cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libasound2-dev \
+            gcc-mingw-w64-x86-64
+
+      - name: Run tests
+        run: go test -race ./...
+
+      - name: Build release binaries
+        run: |
+          go build -trimpath -ldflags "-s -w" -o audio_server-linux-amd64 ./cmd/server
+          go build -trimpath -ldflags "-s -w" -o audio_client-linux-amd64 ./cmd/client
+          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+            go build -trimpath -ldflags "-s -w -H windowsgui" -o audio_client.exe ./cmd/client
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            audio_server-linux-amd64
+            audio_client-linux-amd64
+            audio_client.exe

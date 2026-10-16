@@ -2,6 +2,6 @@
 Type=Application
 Name=Audio Sharer Server
 Comment=Stream system loopback audio to LAN clients
-Exec=/home/random/src/go-audio-sharer/audio_server -port 5001
+Exec=audio_server
 Terminal=false
 X-GNOME-Autostart-enabled=true

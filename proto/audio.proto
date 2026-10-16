@@ -2,7 +2,7 @@ syntax = "proto3";
 
 import "google/protobuf/empty.proto";
 
-option go_package = "github.com/random/go-audio-sharer/proto";
+option go_package = "github.com/imjustarandomguy/go-audio-sharer/proto";
 option csharp_namespace = "GrpcAudioStreaming";
 
 service AudioStream {

@@ -84,6 +84,7 @@ let node = null;
 let sinkId = '';
 let audioEl = null;
 let processorRegistered = false;
+let pushChunk = null;
 
 const btn = document.getElementById('connectBtn');
 const statusEl = document.getElementById('status');
@@ -95,7 +96,15 @@ function setStatus(text, type) {
 }
 
 function cleanup() {
-  if (node) { try { node.disconnect(); } catch(e) {} node = null; }
+  pushChunk = null;
+  if (node) {
+    try {
+      if (node.port) node.port.close();
+      node.onaudioprocess = null;
+      node.disconnect();
+    } catch(e) {}
+    node = null;
+  }
   if (audioEl) {
     try { audioEl.pause(); audioEl.srcObject = null; } catch(e) {}
     audioEl = null;
@@ -130,6 +139,9 @@ btn.onclick = async function() {
 
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   ctx = new AudioCtx();
+  if (ctx.state === 'suspended') {
+    try { await ctx.resume(); } catch(e) {}
+  }
   audioEl = new Audio();
   audioEl.autoplay = true;
 
@@ -149,7 +161,7 @@ btn.onclick = async function() {
     } catch (e) { /* ignore */ }
   }
 
-  if (sinkId && !deviceLabel.textContent) {
+  if (sinkId && !deviceLabel.textContent && navigator.mediaDevices?.enumerateDevices) {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
       const d = devices.find(x => x.deviceId === sinkId);
@@ -169,92 +181,175 @@ btn.onclick = async function() {
 
   ws.onmessage = async function(e) {
     if (e.data instanceof ArrayBuffer) {
-      if (node) node.port.postMessage(e.data);
+      if (node && node.port) {
+        node.port.postMessage(e.data);
+      } else if (pushChunk) {
+        pushChunk(e.data);
+      }
       return;
     }
 
     try {
       const fmt = JSON.parse(e.data);
-      setStatus(fmt.sampleRate + ' Hz \u00b7 ' + fmt.channels + ' ch', 'connected');
+      const isSecure = window.isSecureContext && Boolean(ctx.audioWorklet);
+      const modeSuffix = isSecure ? '' : ' (compat mode)';
+      setStatus(fmt.sampleRate + ' Hz \u00b7 ' + fmt.channels + ' ch' + modeSuffix, 'connected');
 
       // If AudioContext sample rate doesn't match stream, recreate it with the correct rate.
       if (ctx.sampleRate !== fmt.sampleRate) {
         try { await ctx.close(); } catch(err) {}
         ctx = new AudioCtx({ sampleRate: fmt.sampleRate });
+        if (ctx.state === 'suspended') {
+          try { await ctx.resume(); } catch(e) {}
+        }
         processorRegistered = false;
       }
 
-      if (processorRegistered) {
+      const maxQueueBytes = Math.max(fmt.sampleRate * fmt.channels * 2 * 0.1, 4096); // 100ms buffer bound
+
+      if (isSecure) {
+        if (processorRegistered) {
+          node = new AudioWorkletNode(ctx, 'audio-sharer-processor', {
+            outputChannelCount: [fmt.channels]
+          });
+          if (sinkId && audioEl.setSinkId) {
+            const dest = ctx.createMediaStreamDestination();
+            node.connect(dest);
+            audioEl.srcObject = dest.stream;
+            audioEl.play().catch(function(e) { console.log('play error:', e); });
+          } else {
+            node.connect(ctx.destination);
+          }
+          return;
+        }
+
+        const code = [
+          'class P extends AudioWorkletProcessor {',
+          '  constructor() {',
+          '    super();',
+          '    this.q = [];',
+          '    this.curBytes = 0;',
+          '    this.maxQueueBytes = ' + maxQueueBytes + ';',
+          '    this.port.onmessage = (e) => {',
+          '      const src = new Int16Array(e.data);',
+          '      this.q.push(src);',
+          '      this.curBytes += src.byteLength;',
+          '      while (this.curBytes > this.maxQueueBytes && this.q.length > 1) {',
+          '        const dropped = this.q.shift();',
+          '        this.curBytes -= dropped.byteLength;',
+          '      }',
+          '    };',
+          '  }',
+          '  process(inputs, outputs) {',
+          '    const out = outputs[0];',
+          '    const ch = out.length;',
+          '    const n = out[0].length;',
+          '    if (this.q.length === 0) return true;',
+          '    let fill = 0;',
+          '    while (this.q.length > 0 && fill < n) {',
+          '      const src = this.q[0];',
+          '      const frames = Math.floor(src.length / ch);',
+          '      const need = n - fill;',
+          '      const take = Math.min(need, frames);',
+          '      for (let c = 0; c < ch; c++) {',
+          '        const chOut = out[c];',
+          '        for (let i = 0; i < take; i++) {',
+          '          chOut[fill + i] = src[i * ch + c] / 32768;',
+          '        }',
+          '      }',
+          '      if (take < frames) {',
+          '        this.q[0] = src.slice(take * ch);',
+          '        this.curBytes -= take * ch * 2;',
+          '      } else {',
+          '        this.curBytes -= this.q.shift().byteLength;',
+          '      }',
+          '      fill += take;',
+          '    }',
+          '    return true;',
+          '  }',
+          '}',
+          'registerProcessor("audio-sharer-processor", P);'
+        ].join('\n');
+
+        const blob = new Blob([code], { type: 'application/javascript' });
+        await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
+        processorRegistered = true;
+
         node = new AudioWorkletNode(ctx, 'audio-sharer-processor', {
           outputChannelCount: [fmt.channels]
         });
-        const dest = ctx.createMediaStreamDestination();
-        node.connect(dest);
-        audioEl.srcObject = dest.stream;
-        audioEl.play().catch(function(e) { console.log('play error:', e); });
-        return;
+        if (sinkId && audioEl.setSinkId) {
+          const dest = ctx.createMediaStreamDestination();
+          node.connect(dest);
+          audioEl.srcObject = dest.stream;
+          audioEl.play().catch(function(e) { console.log('play error:', e); });
+        } else {
+          node.connect(ctx.destination);
+        }
+      } else {
+        // Fallback ScriptProcessorNode path for insecure contexts (e.g. LAN IP over HTTP)
+        let q = [];
+        let curBytes = 0;
+        pushChunk = function(data) {
+          const src = new Int16Array(data);
+          q.push(src);
+          curBytes += src.byteLength;
+          while (curBytes > maxQueueBytes && q.length > 1) {
+            const dropped = q.shift();
+            curBytes -= dropped.byteLength;
+          }
+        };
+
+        const bufferSize = 2048;
+        const sp = ctx.createScriptProcessor(bufferSize, 0, fmt.channels);
+        sp.onaudioprocess = function(audioEvt) {
+          const out = audioEvt.outputBuffer;
+          const ch = out.numberOfChannels;
+          const n = out.length;
+          if (q.length === 0) {
+            for (let c = 0; c < ch; c++) {
+              out.getChannelData(c).fill(0);
+            }
+            return;
+          }
+          let fill = 0;
+          while (q.length > 0 && fill < n) {
+            const src = q[0];
+            const frames = Math.floor(src.length / ch);
+            const need = n - fill;
+            const take = Math.min(need, frames);
+            for (let c = 0; c < ch; c++) {
+              const chOut = out.getChannelData(c);
+              for (let i = 0; i < take; i++) {
+                chOut[fill + i] = src[i * ch + c] / 32768;
+              }
+            }
+            if (take < frames) {
+              q[0] = src.slice(take * ch);
+              curBytes -= take * ch * 2;
+            } else {
+              curBytes -= q.shift().byteLength;
+            }
+            fill += take;
+          }
+          for (let c = 0; c < ch; c++) {
+            const chOut = out.getChannelData(c);
+            for (let i = fill; i < n; i++) {
+              chOut[i] = 0;
+            }
+          }
+        };
+
+        if (sinkId && audioEl.setSinkId) {
+          const dest = ctx.createMediaStreamDestination();
+          sp.connect(dest);
+          audioEl.srcObject = dest.stream;
+          audioEl.play().catch(function(e) { console.log('play error:', e); });
+        } else {
+          sp.connect(ctx.destination);
+        }
+        node = sp;
       }
-
-      const maxQueueBytes = Math.max(fmt.sampleRate * fmt.channels * 2 * 0.1, 4096); // 100ms buffer bound
-      const code = [
-        'class P extends AudioWorkletProcessor {',
-        '  constructor() {',
-        '    super();',
-        '    this.q = [];',
-        '    this.curBytes = 0;',
-        '    this.maxQueueBytes = ' + maxQueueBytes + ';',
-        '    this.port.onmessage = (e) => {',
-        '      const src = new Int16Array(e.data);',
-        '      this.q.push(src);',
-        '      this.curBytes += src.byteLength;',
-        '      while (this.curBytes > this.maxQueueBytes && this.q.length > 1) {',
-        '        const dropped = this.q.shift();',
-        '        this.curBytes -= dropped.byteLength;',
-        '      }',
-        '    };',
-        '  }',
-        '  process(inputs, outputs) {',
-        '    const out = outputs[0];',
-        '    const ch = out.length;',
-        '    const n = out[0].length;',
-        '    if (this.q.length === 0) return true;',
-        '    let fill = 0;',
-        '    while (this.q.length > 0 && fill < n) {',
-        '      const src = this.q[0];',
-        '      const frames = Math.floor(src.length / ch);',
-        '      const need = n - fill;',
-        '      const take = Math.min(need, frames);',
-        '      for (let c = 0; c < ch; c++) {',
-        '        const chOut = out[c];',
-        '        for (let i = 0; i < take; i++) {',
-        '          chOut[fill + i] = src[i * ch + c] / 32768;',
-        '        }',
-        '      }',
-        '      if (take < frames) {',
-        '        this.q[0] = src.slice(take * ch);',
-        '        this.curBytes -= take * ch * 2;',
-        '      } else {',
-        '        this.curBytes -= this.q.shift().byteLength;',
-        '      }',
-        '      fill += take;',
-        '    }',
-        '    return true;',
-        '  }',
-        '}',
-        'registerProcessor("audio-sharer-processor", P);'
-      ].join('\n');
-
-      const blob = new Blob([code], { type: 'application/javascript' });
-      await ctx.audioWorklet.addModule(URL.createObjectURL(blob));
-      processorRegistered = true;
-
-      node = new AudioWorkletNode(ctx, 'audio-sharer-processor', {
-        outputChannelCount: [fmt.channels]
-      });
-      const dest = ctx.createMediaStreamDestination();
-      node.connect(dest);
-      audioEl.srcObject = dest.stream;
-      audioEl.play().catch(function(e) { console.log('play error:', e); });
     } catch (e) {
       console.log('Error processing message:', e);
       setStatus('Error: ' + e.message, 'error');
