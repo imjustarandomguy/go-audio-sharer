@@ -1,16 +1,24 @@
 # Go Audio Sharer
 
-A high-performance, low-latency gRPC and WebSocket service for streaming system loopback audio across a local network to desktop clients or web browsers.
+A high-performance, low-latency gRPC and WebSocket service for streaming system loopback audio from a **Linux** host across a local network to **cross-platform clients** (Linux, Windows, macOS, or any web browser).
+
+## Platform Support
+
+| Component | Supported Platforms | Notes |
+|-----------|---------------------|-------|
+| **Server** (`audio_server`) | **Linux** | Captures system audio loopback via PulseAudio / PipeWire (`Monitor of <sink>`) |
+| **Native Client** (`audio_client`) | **Linux, Windows, macOS** | Uses `malgo` (miniaudio) for playback and `systray` for the system tray UI |
+| **Web Player** | **Any modern browser** | Built into the server over HTTP/WebSocket (`:8080` by default) |
 
 ## Features
 
 - **Low Latency**: Configurable capture and playback buffer sizes (default 10ms).
 - **On-Demand Capture**: Captures and streams audio only while at least one client is connected.
 - **Built-in Web Player**: Zero-install browser player served over HTTP/WebSocket (`:8080` by default) with output device selection.
-- **System Tray UI**: Both server and client run in the system tray (Linux, Windows, macOS) or headless via `-no-tray`.
-- **Automatic Reconnect**: Reconnects automatically with exponential backoff and immediately upon network recovery (such as waking from sleep).
+- **System Tray UI**: Both the Linux server and the cross-platform client run in the system tray (or headless via `-no-tray`).
+- **Automatic Reconnect**: Client reconnects automatically with exponential backoff and immediately upon network recovery (such as waking from sleep).
 - **Network Interface Binding**: Optionally bind client connections to a specific LAN interface to bypass VPN tunnels or virtual adapters.
-- **Cross-Platform Audio (`malgo`/miniaudio)**: Select a specific audio device or follow the OS default device automatically; captures system loopback on Linux via PulseAudio/PipeWire monitor sources.
+- **Device Selection & Default Following**: Pin capture/playback to a specific audio device or automatically follow OS default device changes.
 - **Configurable**: Adjustable sample rate, channels, buffer size, target latency, and playback volume (16-bit PCM).
 
 ## Build
@@ -19,11 +27,11 @@ A high-performance, low-latency gRPC and WebSocket service for streaming system 
 # Regenerate protobuf code if proto/audio.proto is modified
 ./build_proto.sh
 
-# Build the server and client (native platform)
+# Build the server (Linux) and client (native platform)
 go build -o audio_server ./cmd/server
 go build -o audio_client ./cmd/client
 
-# Build the Windows client
+# Build the Windows client (cross-compile from Linux with mingw-w64)
 ./build_windows.sh
 ```
 
@@ -39,7 +47,7 @@ sudo apt install build-essential libgtk-3-dev libayatana-appindicator3-dev libas
 sudo pacman -S --needed base-devel gtk3 libayatana-appindicator alsa-lib
 ```
 
-### Building for Windows
+### Building the Windows Client
 
 Because `malgo` (miniaudio) uses `cgo`, building `audio_client.exe` requires a C toolchain targeting Windows—either natively on Windows or cross-compiled from Linux with `mingw-w64`:
 
@@ -52,7 +60,9 @@ CGO_ENABLED=1 GOOS=windows CC=x86_64-w64-mingw32-gcc \
   go build -o audio_client.exe -ldflags "-H windowsgui" ./cmd/client
 ```
 
-## Server Usage
+## Server Usage (Linux)
+
+The server runs on Linux and captures system loopback audio from a PulseAudio or PipeWire monitor source.
 
 ```bash
 ./audio_server [flags]
