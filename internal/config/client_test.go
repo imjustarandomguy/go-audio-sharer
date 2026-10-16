@@ -33,7 +33,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	orig := Default()
 	orig.Server = "192.168.1.50:5001"
 	orig.Interface = "Ethernet"
-	orig.Device = "Arctis Nova 7"
+	orig.Device = "Headphones"
 	orig.LatencyMs = 20
 	orig.Volume = 0.5
 	orig.AutoConnect = false
