@@ -9,8 +9,8 @@ import (
 
 func TestDefault(t *testing.T) {
 	c := Default()
-	if c.Server != "localhost:50051" {
-		t.Errorf("Server = %q, want localhost:50051", c.Server)
+	if c.Server != "localhost:5001" {
+		t.Errorf("Server = %q, want localhost:5001", c.Server)
 	}
 	if c.LatencyMs != 10 {
 		t.Errorf("LatencyMs = %d, want 10 (as low as possible)", c.LatencyMs)
@@ -31,7 +31,7 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", dir)
 
 	orig := Default()
-	orig.Server = "192.168.1.50:50051"
+	orig.Server = "192.168.1.50:5001"
 	orig.Interface = "Ethernet"
 	orig.Device = "Arctis Nova 7"
 	orig.LatencyMs = 20

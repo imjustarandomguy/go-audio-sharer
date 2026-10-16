@@ -6,15 +6,15 @@ import (
 )
 
 func TestDialTargetIPNoInterface(t *testing.T) {
-	local, target, err := DialTarget("192.168.1.50:50051", nil)
+	local, target, err := DialTarget("192.168.1.50:5001", nil)
 	if err != nil {
 		t.Fatalf("DialTarget: %v", err)
 	}
 	if local != nil {
 		t.Errorf("local = %v, want nil", local)
 	}
-	if target != "192.168.1.50:50051" {
-		t.Errorf("target = %q, want 192.168.1.50:50051", target)
+	if target != "192.168.1.50:5001" {
+		t.Errorf("target = %q, want 192.168.1.50:5001", target)
 	}
 }
 
@@ -24,15 +24,15 @@ func TestDialTargetWithInterface(t *testing.T) {
 		IP:   net.ParseIP("10.0.0.5"),
 		Net:  &net.IPNet{IP: net.ParseIP("10.0.0.0"), Mask: net.CIDRMask(8, 32)},
 	}
-	local, target, err := DialTarget("10.1.2.3:50051", iface)
+	local, target, err := DialTarget("10.1.2.3:5001", iface)
 	if err != nil {
 		t.Fatalf("DialTarget: %v", err)
 	}
 	if local == nil || !local.Equal(net.ParseIP("10.0.0.5")) {
 		t.Errorf("local = %v, want 10.0.0.5", local)
 	}
-	if target != "10.1.2.3:50051" {
-		t.Errorf("target = %q, want 10.1.2.3:50051", target)
+	if target != "10.1.2.3:5001" {
+		t.Errorf("target = %q, want 10.1.2.3:5001", target)
 	}
 }
 

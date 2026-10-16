@@ -202,7 +202,7 @@ func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, conf
 }
 
 func main() {
-	port := flag.String("port", "50051", "Port to listen on")
+	port := flag.String("port", "5001", "Port to listen on")
 	bufferMs := flag.Int("buffer-ms", 10, "Buffer size in milliseconds")
 	sampleRate := flag.Int("rate", 48000, "Sample rate")
 	channels := flag.Int("channels", 2, "Number of channels")

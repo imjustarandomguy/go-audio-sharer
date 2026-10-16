@@ -21,7 +21,7 @@
             "mode": "auto",
             "program": "${workspaceFolder}/cmd/client/main.go",
             "args": [
-                "-server", "localhost:50051"
+                "-server", "localhost:5001"
             ],
             "env": {},
             "cwd": "${workspaceFolder}"

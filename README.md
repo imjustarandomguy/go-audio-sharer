@@ -62,7 +62,7 @@ CGO_ENABLED=1 GOOS=windows CC=x86_64-w64-mingw32-gcc \
 
 | Flag         | Description                                          | Default    |
 |--------------|------------------------------------------------------|------------|
-| `-port`      | gRPC port to listen on                               | `50051`    |
+| `-port`      | gRPC port to listen on                               | `5001`    |
 | `-device`    | Audio device to loopback from (substring match)      | (default)  |
 | `-buffer-ms` | Capture buffer size in milliseconds                  | `10`       |
 | `-rate`      | Sample rate                                          | `48000`    |
@@ -105,7 +105,7 @@ It also accepts CLI flags which override the config for that run (useful for tes
 
 ```bash
 ./audio_client \
-  -server 192.168.1.10:50051 \  # override the server address
+  -server 192.168.1.10:5001 \  # override the server address
   -device "Arctis Nova 7" \     # override the output device
   -latency 20 \                 # override latency in ms
   -no-tray                      # run headless: print status to the terminal (no tray icon)
@@ -145,7 +145,7 @@ Settings are kept in a JSON file and edited via the tray or config file directly
 
 ```json
 {
-  "server": "192.168.1.10:50051",
+  "server": "192.168.1.10:5001",
   "interface": "Ethernet",
   "device": "",
   "latency_ms": 10,
