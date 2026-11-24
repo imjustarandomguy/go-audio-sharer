@@ -44,6 +44,68 @@ func newAudioContextWith(backends []malgo.Backend) (*malgo.AllocatedContext, err
 	return ctx, nil
 }
 
+type ctxReq struct {
+	fn   func(malgo.Context) error
+	resp chan error
+}
+
+// lockedAudioContext owns a malgo.AllocatedContext pinned to a single OS thread
+// via runtime.LockOSThread(). This ensures Windows WASAPI COM initialization
+// (CoInitializeEx), device control, and teardown (CoUninitialize) always run on
+// the same OS thread, regardless of which Go goroutine calls Start/Stop/Close.
+type lockedAudioContext struct {
+	reqCh chan ctxReq
+	done  chan struct{}
+	once  sync.Once
+}
+
+func newLockedAudioContext(backends []malgo.Backend) (*lockedAudioContext, error) {
+	reqCh := make(chan ctxReq)
+	done := make(chan struct{})
+	initErr := make(chan error, 1)
+
+	go func() {
+		runtime.LockOSThread()
+		defer close(done)
+
+		c, err := newAudioContextWith(backends)
+		if err != nil {
+			initErr <- err
+			return
+		}
+		initErr <- nil
+
+		for req := range reqCh {
+			req.resp <- req.fn(c.Context)
+		}
+
+		_ = c.Uninit()
+		c.Free()
+	}()
+
+	if err := <-initErr; err != nil {
+		<-done
+		return nil, err
+	}
+	return &lockedAudioContext{
+		reqCh: reqCh,
+		done:  done,
+	}, nil
+}
+
+func (l *lockedAudioContext) do(fn func(malgo.Context) error) error {
+	resp := make(chan error, 1)
+	l.reqCh <- ctxReq{fn: fn, resp: resp}
+	return <-resp
+}
+
+func (l *lockedAudioContext) close() {
+	l.once.Do(func() {
+		close(l.reqCh)
+		<-l.done
+	})
+}
+
 // playbackDevice selects the playback device to use: a substring match against
 // filter when set, otherwise the system default device.
 func playbackDevice(ctx malgo.Context, filter string) (*malgo.DeviceInfo, error) {
@@ -230,17 +292,17 @@ type DeviceMonitor struct {
 	filter   string
 	mu       sync.Mutex
 	current  string
-	onChange func(info *malgo.DeviceInfo)
+	onChange func(info *malgo.DeviceInfo) bool
 	stopCh   chan struct{}
 	done     chan struct{}
 	once     sync.Once
 }
 
-func newDeviceMonitor(filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
+func newDeviceMonitor(filter string, onChange func(*malgo.DeviceInfo) bool) *DeviceMonitor {
 	return newDeviceMonitorForBackends("default", nil, filter, onChange)
 }
 
-func newDeviceMonitorForBackends(key string, backends []malgo.Backend, filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
+func newDeviceMonitorForBackends(key string, backends []malgo.Backend, filter string, onChange func(*malgo.DeviceInfo) bool) *DeviceMonitor {
 	pollFn := func() (*malgo.DeviceInfo, error) {
 		return defaultPlaybackDeviceFromDiscovery(key, backends)
 	}
@@ -251,7 +313,7 @@ func newDeviceMonitorWith(
 	pollFn func() (*malgo.DeviceInfo, error),
 	interval, debounce time.Duration,
 	filter string,
-	onChange func(*malgo.DeviceInfo),
+	onChange func(*malgo.DeviceInfo) bool,
 ) *DeviceMonitor {
 	dm := &DeviceMonitor{
 		pollFn:   pollFn,
@@ -331,15 +393,34 @@ func (dm *DeviceMonitor) pollOnce() {
 		info = info2
 	}
 
+	// Avoid a wasted device reopen if close() was called while debouncing.
+	select {
+	case <-dm.stopCh:
+		return
+	default:
+	}
+
 	dm.mu.Lock()
 	changed := dm.filter == "" && dm.current != "" && id != dm.current
-	if dm.filter == "" {
-		dm.current = id
-	}
 	dm.mu.Unlock()
 
-	if changed && dm.onChange != nil {
-		dm.onChange(info)
+	if !changed {
+		return
+	}
+
+	// Only commit dm.current after onChange reports success, so transient
+	// reopen failures (e.g. Bluetooth/USB switch in progress) automatically
+	// retry on the next poll instead of leaving audio permanently stalled.
+	applied := true
+	if dm.onChange != nil {
+		applied = dm.onChange(info)
+	}
+	if applied {
+		dm.mu.Lock()
+		if dm.filter == "" {
+			dm.current = id
+		}
+		dm.mu.Unlock()
 	}
 }
 

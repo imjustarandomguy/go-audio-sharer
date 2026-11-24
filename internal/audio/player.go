@@ -76,7 +76,7 @@ func (s *playbackState) reset() {
 // It supports selecting a specific output device and automatically follows the
 // system default output device when none is explicitly selected.
 type Player struct {
-	ctx     *malgo.AllocatedContext
+	ctx     *lockedAudioContext
 	device  *malgo.Device
 	monitor *DeviceMonitor
 
@@ -134,7 +134,7 @@ func (p *Player) TakeStats() PlayerStats {
 }
 
 func NewPlayer(cfg Config) (*Player, error) {
-	ctx, err := newAudioContext()
+	ctx, err := newLockedAudioContext(nil)
 	if err != nil {
 		return nil, err
 	}
@@ -149,8 +149,8 @@ func NewPlayer(cfg Config) (*Player, error) {
 	p.ring = newByteRingBuffer(ringCap)
 	p.volumeBits.Store(math.Float64bits(1.0))
 	p.pb.scratch = make([]byte, 64*1024)
-	p.monitor = newDeviceMonitor(cfg.Device, func(info *malgo.DeviceInfo) {
-		p.followDefault(info)
+	p.monitor = newDeviceMonitor(cfg.Device, func(info *malgo.DeviceInfo) bool {
+		return p.followDefault(info)
 	})
 	return p, nil
 }
@@ -165,52 +165,73 @@ func (p *Player) SetVolume(v float64) {
 	p.volumeBits.Store(math.Float64bits(v))
 }
 
-// createDevice initializes the playback device for the currently chosen
-// output. Caller must not hold p.mu around device.Stop/Uninit calls.
-func (p *Player) createDevice() (*malgo.Device, error) {
-	info, err := playbackDevice(p.ctx.Context, p.config.Device)
-	if err != nil {
-		return nil, err
-	}
+// openAndStartDevice initializes and starts the playback device on the pinned
+// audio context thread. Caller must not hold p.mu around this call.
+func (p *Player) openAndStartDevice() (*malgo.Device, malgo.DeviceID, error) {
+	var (
+		dev   *malgo.Device
+		devID malgo.DeviceID
+	)
+	err := p.ctx.do(func(ctx malgo.Context) error {
+		info, err := playbackDevice(ctx, p.config.Device)
+		if err != nil {
+			return err
+		}
 
-	p.mu.Lock()
-	p.devID = info.ID
-	p.devName = info.Name()
-	p.mu.Unlock()
-	log.Printf("Playback device: %s", info.Name())
-	if p.monitor != nil {
-		p.monitor.setCurrent(info.ID.String())
-	}
+		p.mu.Lock()
+		p.devID = info.ID
+		p.devName = info.Name()
+		p.mu.Unlock()
+		log.Printf("Playback device: %s", info.Name())
 
-	// Keep the hardware callback period crisp (5-10 ms) even when the user
-	// selects a larger jitter buffer target (e.g. 30-100 ms), so the extra
-	// latency goes into the jitter buffer rather than sluggish hardware periods.
-	periodMs := p.config.BufferMs
-	if periodMs <= 0 {
-		periodMs = 10
-	}
-	if periodMs > 10 {
-		periodMs = 10
-	}
+		// Keep the hardware callback period crisp (5-10 ms) even when the user
+		// selects a larger jitter buffer target (e.g. 30-100 ms), so the extra
+		// latency goes into the jitter buffer rather than sluggish hardware periods.
+		periodMs := p.config.BufferMs
+		if periodMs <= 0 {
+			periodMs = 10
+		}
+		if periodMs > 10 {
+			periodMs = 10
+		}
 
-	dc := malgo.DefaultDeviceConfig(malgo.Playback)
-	dc.Playback.Format = malgo.FormatS16
-	dc.Playback.Channels = uint32(p.config.Channels)
-	dc.SampleRate = uint32(p.config.SampleRate)
-	dc.PeriodSizeInMilliseconds = uint32(periodMs)
-	dc.Alsa.NoMMap = 1
+		dc := malgo.DefaultDeviceConfig(malgo.Playback)
+		dc.Playback.Format = malgo.FormatS16
+		dc.Playback.Channels = uint32(p.config.Channels)
+		dc.SampleRate = uint32(p.config.SampleRate)
+		dc.PeriodSizeInMilliseconds = uint32(periodMs)
+		dc.Alsa.NoMMap = 1
 
-	// Pin to a specific device only when one was explicitly requested; otherwise
-	// use the default device (which the monitor then follows).
-	if p.config.Device != "" {
-		dc.Playback.DeviceID = info.ID.Pointer()
-	}
+		// Pin to a specific device only when one was explicitly requested; otherwise
+		// use the default device (which the monitor then follows).
+		if p.config.Device != "" {
+			dc.Playback.DeviceID = info.ID.Pointer()
+		}
 
-	device, err := malgo.InitDevice(p.ctx.Context, dc, malgo.DeviceCallbacks{Data: p.onData})
-	if err != nil {
-		return nil, fmt.Errorf("could not init playback device: %w", err)
+		d, err := malgo.InitDevice(ctx, dc, malgo.DeviceCallbacks{Data: p.onData})
+		if err != nil {
+			return fmt.Errorf("could not init playback device: %w", err)
+		}
+		if err := d.Start(); err != nil {
+			d.Uninit()
+			return err
+		}
+		dev = d
+		devID = info.ID
+		return nil
+	})
+	return dev, devID, err
+}
+
+func (p *Player) stopDevice(dev *malgo.Device) {
+	if dev == nil {
+		return
 	}
-	return device, nil
+	_ = p.ctx.do(func(_ malgo.Context) error {
+		_ = dev.Stop()
+		dev.Uninit()
+		return nil
+	})
 }
 
 func (p *Player) Start() error {
@@ -226,13 +247,12 @@ func (p *Player) Start() error {
 
 	p.pb.reset()
 
-	dev, err := p.createDevice()
+	dev, devID, err := p.openAndStartDevice()
 	if err != nil {
 		return err
 	}
-	if err := dev.Start(); err != nil {
-		dev.Uninit()
-		return err
+	if p.monitor != nil {
+		p.monitor.setCurrent(devID.String())
 	}
 
 	p.mu.Lock()
@@ -642,17 +662,19 @@ func fadeOutTailS16(b []byte, channels, fadeFrames int) {
 }
 
 // followDefault re-creates the playback device when the default output changes.
-func (p *Player) followDefault(info *malgo.DeviceInfo) {
+// Returns true when playback is active (or stopped by caller), or false when
+// reopening failed transiently so DeviceMonitor retries on the next poll.
+func (p *Player) followDefault(info *malgo.DeviceInfo) bool {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
 
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
-		return
+		return true
 	}
 	// Keep p.started true while swapping so a transient reopen error (e.g.
-	// Bluetooth/USB switch in progress) can still recover on the next event.
+	// Bluetooth/USB switch in progress) can still recover on the next poll.
 	old := p.device
 	p.device = nil
 	p.devID = info.ID
@@ -663,34 +685,20 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 
 	// Stop old device before resetting the SPSC ring buffer and consumer state
 	// so onData is no longer running.
-	if old != nil {
-		_ = old.Stop()
-		old.Uninit()
-	}
+	p.stopDevice(old)
 	p.ring.Reset()
 	p.pb.reset()
 
-	dev, err := p.createDevice()
+	dev, _, err := p.openAndStartDevice()
 	if err != nil {
 		log.Printf("Error reopening device after change: %v", err)
-		return
-	}
-	if err := dev.Start(); err != nil {
-		log.Printf("Error starting device after change: %v", err)
-		dev.Uninit()
-		return
+		return false
 	}
 
 	p.mu.Lock()
-	if !p.started {
-		// Stop() was called concurrently; clean up the newly created device.
-		p.mu.Unlock()
-		_ = dev.Stop()
-		dev.Uninit()
-		return
-	}
 	p.device = dev
 	p.mu.Unlock()
+	return true
 }
 
 func (p *Player) Stop() {
@@ -709,10 +717,7 @@ func (p *Player) Stop() {
 
 	// Stop device before resetting the SPSC ring buffer and consumer state
 	// so onData is no longer running.
-	if dev != nil {
-		_ = dev.Stop()
-		dev.Uninit()
-	}
+	p.stopDevice(dev)
 	p.ring.Reset()
 	p.pb.reset()
 	p.lastWriteNs.Store(0)
@@ -736,8 +741,7 @@ func (p *Player) Close() {
 	}
 	p.Stop()
 	if p.ctx != nil {
-		_ = p.ctx.Uninit()
-		p.ctx.Free()
+		p.ctx.close()
 	}
 }
 

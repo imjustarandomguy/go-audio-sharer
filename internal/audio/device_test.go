@@ -76,8 +76,9 @@ func TestDeviceMonitorDebounceTransientGlitch(t *testing.T) {
 		debounce: 10 * time.Millisecond,
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
-		onChange: func(info *malgo.DeviceInfo) {
+		onChange: func(info *malgo.DeviceInfo) bool {
 			changes.Add(1)
+			return true
 		},
 	}
 	dm.setCurrent(devA.ID.String())
@@ -100,8 +101,9 @@ func TestDeviceMonitorConfirmedChange(t *testing.T) {
 		debounce: 10 * time.Millisecond,
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
-		onChange: func(info *malgo.DeviceInfo) {
+		onChange: func(info *malgo.DeviceInfo) bool {
 			changes.Add(1)
+			return true
 		},
 	}
 	dm.setCurrent(devA.ID.String())
@@ -115,6 +117,35 @@ func TestDeviceMonitorConfirmedChange(t *testing.T) {
 	dm.pollOnce()
 	if changes.Load() != 1 {
 		t.Fatalf("expected no duplicate change callback, got %d", changes.Load())
+	}
+}
+
+func TestDeviceMonitorRetriesFailedOnChange(t *testing.T) {
+	devA := fakeDeviceInfo('A')
+	devB := fakeDeviceInfo('B')
+
+	var attempts atomic.Int32
+	dm := &DeviceMonitor{
+		pollFn: func() (*malgo.DeviceInfo, error) {
+			return devB, nil
+		},
+		debounce: 5 * time.Millisecond,
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
+		onChange: func(info *malgo.DeviceInfo) bool {
+			// First two attempts fail transiently; third succeeds.
+			return attempts.Add(1) >= 3
+		},
+	}
+	dm.setCurrent(devA.ID.String())
+
+	dm.pollOnce()
+	dm.pollOnce()
+	dm.pollOnce()
+	dm.pollOnce() // should not fire again once attempt 3 succeeded
+
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("onChange attempts = %d, want 3 (2 retries + 1 success)", got)
 	}
 }
 
@@ -136,8 +167,9 @@ func TestDeviceMonitorCloseCancelsMidDebounce(t *testing.T) {
 		10*time.Millisecond,
 		5*time.Second, // long debounce so close() must abort it immediately
 		"",
-		func(info *malgo.DeviceInfo) {
+		func(info *malgo.DeviceInfo) bool {
 			changes.Add(1)
+			return true
 		},
 	)
 	dm.setCurrent(devA.ID.String())
@@ -171,8 +203,9 @@ func TestDeviceMonitorSetFilterDuringDebounceSuppressesChange(t *testing.T) {
 		debounce: 40 * time.Millisecond,
 		stopCh:   make(chan struct{}),
 		done:     make(chan struct{}),
-		onChange: func(info *malgo.DeviceInfo) {
+		onChange: func(info *malgo.DeviceInfo) bool {
 			changes.Add(1)
+			return true
 		},
 	}
 	dm.setCurrent(devA.ID.String())
