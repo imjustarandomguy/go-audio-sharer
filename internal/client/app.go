@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	minBackoff = time.Second
-	maxBackoff = 30 * time.Second
+	minBackoff  = time.Second
+	maxBackoff  = 5 * time.Second
+	stopTimeout = 2 * time.Second
 )
 
 // App manages the client streaming session, reconnect logic, and state.
@@ -143,7 +144,11 @@ func (a *App) Stop() {
 		cancel()
 	}
 	if loopDone != nil {
-		<-loopDone
+		select {
+		case <-loopDone:
+		case <-time.After(stopTimeout):
+			log.Printf("Timed out waiting for streaming loop to stop")
+		}
 	}
 	a.updateStatus("Stopped")
 }
@@ -188,11 +193,17 @@ func (a *App) streamLoop(ctx context.Context, wake <-chan struct{}) {
 			select {
 			case <-ctx.Done():
 				attemptCancel()
-				<-errCh
+				select {
+				case <-errCh:
+				case <-time.After(stopTimeout):
+				}
 				return
 			case <-wake:
 				attemptCancel()
-				<-errCh
+				select {
+				case <-errCh:
+				case <-time.After(stopTimeout):
+				}
 				backoff = minBackoff
 				goto nextAttempt
 			case <-resetBackoffCh:
@@ -320,6 +331,10 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	}()
 
 	runErr := sess.Run(ctx, p.Write)
+	if ctx.Err() == nil {
+		// Reflect disconnect immediately before audio device teardown runs.
+		a.updateStatus("Reconnecting")
+	}
 	if errors.Is(runErr, udpstream.ErrFormatChanged) {
 		log.Printf("Server audio format changed, reconnecting...")
 	}

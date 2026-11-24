@@ -137,10 +137,15 @@ func main() {
 
 			systray.ResetMenu()
 
-			statusItem = systray.AddMenuItem("Status: "+app.Status(), "")
+			status := app.Status()
+			statusItem = systray.AddMenuItem("Status: "+status, "")
 			statusItem.Disable()
 
-			latencyItem = systray.AddMenuItem("Latency: —", "Current buffered playback latency")
+			latText := "Latency: —"
+			if status == "Connected" {
+				latText = fmt.Sprintf("Latency: %.0f ms", app.CurrentLatencyMs())
+			}
+			latencyItem = systray.AddMenuItem(latText, "Current buffered playback latency")
 			latencyItem.Disable()
 
 			cfg := app.Config()
@@ -245,6 +250,8 @@ func main() {
 				safeRebuild()
 			})
 			onClick(menuCtx, quitItem, func() {
+				// Guarantee the process exits even if an OS audio driver or tray call stalls.
+				time.AfterFunc(3*time.Second, func() { os.Exit(0) })
 				if menuCancel != nil {
 					menuCancel()
 				}
@@ -271,12 +278,14 @@ func main() {
 			ticker := time.NewTicker(2 * time.Second)
 			defer ticker.Stop()
 			var last string
+			var lastItem *systray.MenuItem
 			for range ticker.C {
 				rebuildMu.Lock()
 				item := latencyItem
 				rebuildMu.Unlock()
 				if item == nil {
 					last = ""
+					lastItem = nil
 					continue
 				}
 				var s string
@@ -285,11 +294,12 @@ func main() {
 				} else {
 					s = "Latency: —"
 				}
-				if s == last {
+				if item == lastItem && s == last {
 					continue
 				}
 				item.SetTitle(s)
 				last = s
+				lastItem = item
 			}
 		}()
 
