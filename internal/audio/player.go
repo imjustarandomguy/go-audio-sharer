@@ -4,7 +4,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log"
+	"math"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gen2brain/malgo"
 )
@@ -17,14 +19,14 @@ type Player struct {
 	device  *malgo.Device
 	monitor *DeviceMonitor
 
-	opMu    sync.Mutex
-	mu      sync.Mutex
-	ring    *byteRingBuffer
-	volume  float64
-	started bool
-	config  Config
-	devID   malgo.DeviceID
-	devName string
+	opMu       sync.Mutex
+	mu         sync.Mutex
+	ring       *byteRingBuffer
+	volumeBits atomic.Uint64
+	started    bool
+	config     Config
+	devID      malgo.DeviceID
+	devName    string
 }
 
 func NewPlayer(cfg Config) (*Player, error) {
@@ -35,9 +37,9 @@ func NewPlayer(cfg Config) (*Player, error) {
 	p := &Player{
 		ctx:    ctx,
 		config: cfg,
-		volume: 1.0,
 		ring:   newByteRingBuffer(512 * 1024), // 512 KB (~2.7s headroom at 48kHz stereo)
 	}
+	p.volumeBits.Store(math.Float64bits(1.0))
 	p.monitor = newDeviceMonitor(ctx.Context, cfg.Device, func(info *malgo.DeviceInfo) {
 		p.followDefault(info)
 	})
@@ -51,9 +53,7 @@ func (p *Player) SetVolume(v float64) {
 	if v > 1 {
 		v = 1
 	}
-	p.mu.Lock()
-	p.volume = v
-	p.mu.Unlock()
+	p.volumeBits.Store(math.Float64bits(v))
 }
 
 // createDevice initializes the playback device for the currently chosen
@@ -120,29 +120,16 @@ func (p *Player) Start() error {
 	return nil
 }
 
+func (p *Player) frameBytes() int {
+	fb := p.config.Channels * (p.config.BitsPerSample / 8)
+	if fb <= 0 {
+		return 2
+	}
+	return fb
+}
+
 func (p *Player) Write(data []byte) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	frameBytes := p.config.Channels * (p.config.BitsPerSample / 8)
-	if frameBytes <= 0 {
-		frameBytes = 2
-	}
-
-	max := p.maxPendingBytes()
-	total := p.ring.Len() + len(data)
-	if total > max {
-		drop := total - max
-		// Align drop up to the next frame boundary so that the remaining buffer
-		// stays <= max and frame alignment is strictly maintained (preventing
-		// left/right channel flips or byte-shift distortion).
-		if rem := drop % frameBytes; rem != 0 {
-			drop += frameBytes - rem
-		}
-		p.ring.Discard(drop)
-	}
-
-	p.ring.Write(data)
+	p.ring.WriteAligned(data, p.frameBytes())
 	return nil
 }
 
@@ -150,10 +137,7 @@ func (p *Player) Write(data []byte) error {
 // keeps buffered latency at least one device period but never more than a small
 // constant, discarding overflow beyond that.
 func (p *Player) maxPendingBytes() int {
-	frameBytes := p.config.Channels * (p.config.BitsPerSample / 8)
-	if frameBytes <= 0 {
-		frameBytes = 2
-	}
+	frameBytes := p.frameBytes()
 	bytesPerSec := p.config.SampleRate * frameBytes
 	if bytesPerSec <= 0 {
 		return 1 << 16
@@ -166,14 +150,25 @@ func (p *Player) maxPendingBytes() int {
 	return (raw / frameBytes) * frameBytes
 }
 
-// onData is called by miniaudio on its audio thread.
+// onData is called by miniaudio on its real-time audio thread.
+// It must remain lock-free to avoid priority inversion against the network goroutine.
 func (p *Player) onData(out, _ []byte, framecount uint32) {
+	frameBytes := p.frameBytes()
+	max := p.maxPendingBytes()
+	avail := p.ring.Len()
+	if avail > max {
+		drop := avail - max
+		// Align drop up to the next frame boundary so frame alignment is strictly
+		// maintained (preventing left/right channel flips or byte-shift distortion).
+		if rem := drop % frameBytes; rem != 0 {
+			drop += frameBytes - rem
+		}
+		p.ring.Discard(drop)
+	}
+
 	n := p.ring.Read(out)
 
-	p.mu.Lock()
-	vol := p.volume
-	p.mu.Unlock()
-
+	vol := math.Float64frombits(p.volumeBits.Load())
 	if vol != 1.0 {
 		scaleS16(out[:n], vol)
 	}
@@ -200,12 +195,12 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 	p.devName = info.Name()
 	p.mu.Unlock()
 
-	p.ring.Reset()
-
+	// Stop old device before resetting the SPSC ring buffer so onData is no longer running.
 	if old != nil {
 		_ = old.Stop()
 		old.Uninit()
 	}
+	p.ring.Reset()
 
 	dev, err := p.createDevice()
 	if err != nil {
@@ -238,22 +233,19 @@ func (p *Player) Stop() {
 	p.device = nil
 	p.mu.Unlock()
 
-	p.ring.Reset()
-
+	// Stop device before resetting the SPSC ring buffer so onData is no longer running.
 	if dev != nil {
 		_ = dev.Stop()
 		dev.Uninit()
 	}
+	p.ring.Reset()
 }
 
 // LatencyMs returns the approximate current playback latency in milliseconds,
 // derived from how much PCM is currently buffered ahead of the device.
 func (p *Player) LatencyMs() float64 {
 	b := p.ring.Len()
-	p.mu.Lock()
-	cfg := p.config
-	p.mu.Unlock()
-	bytesPerSec := cfg.SampleRate * cfg.Channels * (cfg.BitsPerSample / 8)
+	bytesPerSec := p.config.SampleRate * p.frameBytes()
 	if bytesPerSec <= 0 {
 		return 0
 	}

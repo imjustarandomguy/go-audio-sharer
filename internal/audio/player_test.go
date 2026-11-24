@@ -70,12 +70,12 @@ func TestPlayerWriteFrameAlignment(t *testing.T) {
 	}
 	p := &Player{
 		config: cfg,
-		volume: 1.0,
 		ring:   newByteRingBuffer(16384),
 	}
+	p.SetVolume(1.0)
 
 	frameBytes := cfg.Channels * (cfg.BitsPerSample / 8)
-	// Write distinct identifiable stereo frames: L=1000, R=2000
+	// Write distinct identifiable stereo frames: L=1000, R=-2000
 	makeStereoFrame := func(l, r int16) []byte {
 		b := make([]byte, 4)
 		binary.LittleEndian.PutUint16(b[0:2], uint16(l))
@@ -83,7 +83,7 @@ func TestPlayerWriteFrameAlignment(t *testing.T) {
 		return b
 	}
 
-	// Write more than maxPendingBytes so it triggers surplus drop
+	// Write more than maxPendingBytes so onData triggers surplus drop
 	frame := makeStereoFrame(1000, -2000)
 	buf := make([]byte, 0, 12000)
 	for i := 0; i < 3000; i++ {
@@ -94,14 +94,16 @@ func TestPlayerWriteFrameAlignment(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	// Check that buffered bytes count is an exact multiple of frameBytes
+	// Read out a frame (which trims overflow on consumer side) and verify frame alignment
+	out := make([]byte, 4)
+	p.onData(out, nil, 1)
+
 	if p.ring.Len()%frameBytes != 0 {
 		t.Errorf("buffered bytes %d is not a multiple of frame size %d", p.ring.Len(), frameBytes)
 	}
-
-	// Read out a frame and verify that L is 1000 and R is -2000 (not byte shifted or channel swapped)
-	out := make([]byte, 4)
-	p.onData(out, nil, 1)
+	if p.ring.Len() > p.maxPendingBytes() {
+		t.Errorf("buffered bytes %d exceeds maxPendingBytes %d after trim", p.ring.Len(), p.maxPendingBytes())
+	}
 
 	gotL := SampleAsInt16(out[0:2])
 	gotR := SampleAsInt16(out[2:4])

@@ -2,6 +2,7 @@ package audio
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 )
 
@@ -36,6 +37,13 @@ func TestByteRingBufferBasic(t *testing.T) {
 	}
 }
 
+func TestByteRingBufferPowerOfTwoCap(t *testing.T) {
+	rb := newByteRingBuffer(10)
+	if rb.Cap() != 16 {
+		t.Fatalf("expected Cap rounded up to 16, got %d", rb.Cap())
+	}
+}
+
 func TestByteRingBufferWrapAround(t *testing.T) {
 	rb := newByteRingBuffer(8)
 
@@ -61,23 +69,38 @@ func TestByteRingBufferWrapAround(t *testing.T) {
 	}
 }
 
-func TestByteRingBufferOverflowDiscardsOldest(t *testing.T) {
-	rb := newByteRingBuffer(6)
-	rb.Write([]byte("ABC"))
-	rb.Write([]byte("DEFGH")) // Total 8 > 6, should drop oldest 2 bytes ("AB"), leaving "CDEFGH"
-
-	if rb.Len() != 6 {
-		t.Fatalf("expected Len 6, got %d", rb.Len())
+func TestByteRingBufferBackpressureWhenFull(t *testing.T) {
+	rb := newByteRingBuffer(8)
+	if n := rb.Write([]byte("ABCDEF")); n != 6 {
+		t.Fatalf("wrote %d, want 6", n)
 	}
-	out := make([]byte, 6)
+	// Only 2 bytes free; SPSC Write must not touch consumer tail.
+	if n := rb.Write([]byte("12345")); n != 2 {
+		t.Fatalf("wrote %d, want 2", n)
+	}
+	if rb.Len() != 8 {
+		t.Fatalf("Len = %d, want 8", rb.Len())
+	}
+	out := make([]byte, 8)
 	rb.Read(out)
-	if string(out) != "CDEFGH" {
-		t.Fatalf("got %q, want 'CDEFGH'", out)
+	if string(out) != "ABCDEF12" {
+		t.Fatalf("got %q, want 'ABCDEF12'", out)
+	}
+}
+
+func TestByteRingBufferWriteAligned(t *testing.T) {
+	rb := newByteRingBuffer(8)
+	// Write 6 bytes with frameBytes=4 -> should only write 4 bytes.
+	if n := rb.WriteAligned([]byte("123456"), 4); n != 4 {
+		t.Fatalf("WriteAligned = %d, want 4", n)
+	}
+	if rb.Len() != 4 {
+		t.Fatalf("Len = %d, want 4", rb.Len())
 	}
 }
 
 func TestByteRingBufferDiscard(t *testing.T) {
-	rb := newByteRingBuffer(10)
+	rb := newByteRingBuffer(16)
 	rb.Write([]byte("0123456789"))
 	discarded := rb.Discard(4)
 	if discarded != 4 {
@@ -94,7 +117,7 @@ func TestByteRingBufferDiscard(t *testing.T) {
 }
 
 func TestByteRingBufferReset(t *testing.T) {
-	rb := newByteRingBuffer(10)
+	rb := newByteRingBuffer(16)
 	rb.Write([]byte("abcdef"))
 	rb.Reset()
 	if rb.Len() != 0 {
@@ -103,5 +126,58 @@ func TestByteRingBufferReset(t *testing.T) {
 	out := make([]byte, 5)
 	if n := rb.Read(out); n != 0 {
 		t.Fatalf("read from empty buffer returned %d", n)
+	}
+}
+
+func TestByteRingBufferConcurrentSPSC(t *testing.T) {
+	rb := newByteRingBuffer(4096)
+	const totalBytes = 256 * 1024
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// Producer: writes sequential byte pattern 0,1,2,...,255 repeating
+	go func() {
+		defer wg.Done()
+		chunk := make([]byte, 192)
+		written := 0
+		for written < totalBytes {
+			n := len(chunk)
+			if written+n > totalBytes {
+				n = totalBytes - written
+			}
+			for i := 0; i < n; i++ {
+				chunk[i] = byte((written + i) & 0xFF)
+			}
+			off := 0
+			for off < n {
+				w := rb.WriteAligned(chunk[off:n], 4)
+				off += w
+			}
+			written += n
+		}
+	}()
+
+	// Consumer: reads and verifies every single byte in order
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 128)
+		readTotal := 0
+		for readTotal < totalBytes {
+			r := rb.Read(buf)
+			for i := 0; i < r; i++ {
+				want := byte((readTotal + i) & 0xFF)
+				if buf[i] != want {
+					t.Errorf("byte mismatch at %d: got %d, want %d", readTotal+i, buf[i], want)
+					return
+				}
+			}
+			readTotal += r
+		}
+	}()
+
+	wg.Wait()
+	if rb.Len() != 0 {
+		t.Fatalf("expected empty ring after full SPSC transfer, got %d", rb.Len())
 	}
 }

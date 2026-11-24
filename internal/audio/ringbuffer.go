@@ -1,34 +1,62 @@
 package audio
 
 import (
-	"sync"
+	"sync/atomic"
 )
 
-// byteRingBuffer is a circular byte buffer for streaming audio data without
-// allocating on the heap during playback.
+// byteRingBuffer is a lock-free single-producer, single-consumer (SPSC)
+// circular byte buffer for streaming audio without heap allocations or mutex
+// contention on the real-time audio thread.
+//
+// Concurrency contract:
+//   - Write must only be called by a single producer goroutine.
+//   - Read and Discard must only be called by a single consumer thread (the
+//     audio callback), or Reset while the consumer is stopped.
+//   - Len and Cap may be called concurrently from any goroutine.
 type byteRingBuffer struct {
-	mu    sync.Mutex
-	buf   []byte
-	head  int // write index
-	tail  int // read index
-	count int // number of unread bytes
+	buf  []byte
+	mask uint64
+
+	// Pad atomic counters onto separate cache lines to prevent false sharing
+	// between the network producer goroutine and the real-time audio thread.
+	_    [56]byte
+	head atomic.Uint64 // monotonic total bytes written (producer-owned)
+	_    [56]byte
+	tail atomic.Uint64 // monotonic total bytes read/discarded (consumer-owned)
 }
 
-// newByteRingBuffer creates a ring buffer with the given capacity in bytes.
+// newByteRingBuffer creates a ring buffer with at least capacity bytes,
+// rounded up to the next power of two for fast bitmask indexing.
 func newByteRingBuffer(capacity int) *byteRingBuffer {
 	if capacity <= 0 {
 		capacity = 256 * 1024 // 256 KB default (~1.3s of 48kHz 16-bit stereo)
 	}
+	size := nextPowerOfTwo(capacity)
 	return &byteRingBuffer{
-		buf: make([]byte, capacity),
+		buf:  make([]byte, size),
+		mask: uint64(size - 1),
 	}
 }
 
-// Len returns the number of buffered bytes available to read.
+func nextPowerOfTwo(n int) int {
+	if n <= 1 {
+		return 1
+	}
+	v := 1
+	for v < n {
+		v <<= 1
+	}
+	return v
+}
+
+// Len returns the approximate number of unread bytes available to read.
 func (r *byteRingBuffer) Len() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.count
+	h := r.head.Load()
+	t := r.tail.Load()
+	if h <= t {
+		return 0
+	}
+	return int(h - t)
 }
 
 // Cap returns the total buffer capacity in bytes.
@@ -36,86 +64,100 @@ func (r *byteRingBuffer) Cap() int {
 	return len(r.buf)
 }
 
-// Write writes data into the buffer. If the buffer is full, it discards the
-// oldest unread bytes to make room. Returns the number of bytes written.
+// Write appends as many bytes of p as fit in the buffer without overwriting
+// unread data. Returns the number of bytes written.
 func (r *byteRingBuffer) Write(p []byte) int {
+	return r.WriteAligned(p, 1)
+}
+
+// WriteAligned appends as many complete frameBytes-sized frames from p as fit
+// in the buffer without overwriting unread data. Returns the number of bytes
+// written (always a multiple of frameBytes).
+func (r *byteRingBuffer) WriteAligned(p []byte, frameBytes int) int {
 	if len(p) == 0 {
 		return 0
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// If p is larger than total capacity, only take the newest tail portion.
-	if len(p) > len(r.buf) {
-		p = p[len(p)-len(r.buf):]
+	if frameBytes <= 0 {
+		frameBytes = 1
 	}
 
-	avail := len(r.buf) - r.count
-	if len(p) > avail {
-		r.discardLocked(len(p) - avail)
+	h := r.head.Load()
+	t := r.tail.Load()
+	used := h - t
+	capU := uint64(len(r.buf))
+	if used >= capU {
+		return 0
 	}
+	free := int(capU - used)
 
 	n := len(p)
-	first := copy(r.buf[r.head:], p)
-	if first < n {
-		copy(r.buf, p[first:])
+	if n > free {
+		n = free
 	}
-	r.head = (r.head + n) % len(r.buf)
-	r.count += n
+	if frameBytes > 1 {
+		n = (n / frameBytes) * frameBytes
+	}
+	if n == 0 {
+		return 0
+	}
+
+	idx := int(h & r.mask)
+	first := copy(r.buf[idx:], p[:n])
+	if first < n {
+		copy(r.buf, p[first:n])
+	}
+	r.head.Store(h + uint64(n))
 	return n
 }
 
-// Read reads up to len(p) bytes from the buffer into p.
-// Returns the number of bytes read.
+// Read reads up to len(p) unread bytes from the buffer into p.
+// Returns the number of bytes read. Must only be called by the consumer.
 func (r *byteRingBuffer) Read(p []byte) int {
 	if len(p) == 0 {
 		return 0
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	if r.count == 0 {
+	t := r.tail.Load()
+	h := r.head.Load()
+	if h <= t {
 		return 0
 	}
-
+	avail := int(h - t)
 	n := len(p)
-	if n > r.count {
-		n = r.count
+	if n > avail {
+		n = avail
 	}
 
-	first := copy(p, r.buf[r.tail:min(r.tail+n, len(r.buf))])
+	idx := int(t & r.mask)
+	first := copy(p[:n], r.buf[idx:])
 	if first < n {
-		copy(p[first:], r.buf[:n-first])
+		copy(p[first:n], r.buf[:n-first])
 	}
-	r.tail = (r.tail + n) % len(r.buf)
-	r.count -= n
+	r.tail.Store(t + uint64(n))
 	return n
 }
 
-// Discard discards up to n unread bytes from the oldest buffered audio.
+// Discard advances the read cursor past up to n unread bytes.
+// Must only be called by the consumer (or when the consumer is stopped).
 func (r *byteRingBuffer) Discard(n int) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.discardLocked(n)
-}
-
-func (r *byteRingBuffer) discardLocked(n int) int {
 	if n <= 0 {
 		return 0
 	}
-	if n > r.count {
-		n = r.count
+	t := r.tail.Load()
+	h := r.head.Load()
+	if h <= t {
+		return 0
 	}
-	r.tail = (r.tail + n) % len(r.buf)
-	r.count -= n
+	avail := int(h - t)
+	if n > avail {
+		n = avail
+	}
+	r.tail.Store(t + uint64(n))
 	return n
 }
 
-// Reset clears the buffer.
+// Reset discards all currently buffered unread bytes by advancing the consumer
+// tail to the current producer head. Safe to call when the consumer is stopped,
+// even if the producer is concurrently writing.
 func (r *byteRingBuffer) Reset() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.head = 0
-	r.tail = 0
-	r.count = 0
+	r.tail.Store(r.head.Load())
 }
