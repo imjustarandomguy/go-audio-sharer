@@ -75,6 +75,7 @@ func main() {
 	if f, err := setupLog(); err == nil {
 		defer f.Close()
 	}
+	boostProcessPriority()
 
 	server := flag.String("server", "", "Server address override (host:port); overrides the config file for this run")
 	device := flag.String("device", "", "Audio output device override (substring match)")
