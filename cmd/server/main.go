@@ -113,9 +113,10 @@ func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, conf
 		defer conn.Close()
 
 		addr := r.RemoteAddr
+		regKey := "ws:" + addr
 		log.Printf("WebSocket client connected: %s", addr)
-		registry.Add(addr)
-		defer registry.Remove(addr)
+		registry.Add(regKey)
+		defer registry.Remove(regKey)
 
 		conn.SetCloseHandler(func(code int, text string) error {
 			log.Printf("WebSocket closed by %s: %d %s", addr, code, text)
@@ -148,6 +149,7 @@ func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, conf
 
 func main() {
 	port := flag.String("port", "5001", "UDP port to listen on")
+	bind := flag.String("bind", "", "Optional IP address to bind the UDP listener to (useful on multi-homed hosts)")
 	bufferMs := flag.Int("buffer-ms", 10, "Buffer size in milliseconds")
 	sampleRate := flag.Int("rate", 48000, "Sample rate")
 	channels := flag.Int("channels", 2, "Number of channels")
@@ -156,16 +158,17 @@ func main() {
 	noTray := flag.Bool("no-tray", false, "Run headless without a system tray icon")
 	flag.Parse()
 
-	udpListenAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%s", *port))
+	listenPort := strings.TrimPrefix(strings.TrimSpace(*port), ":")
+	udpAddrStr := net.JoinHostPort(strings.TrimSpace(*bind), listenPort)
+	udpListenAddr, err := net.ResolveUDPAddr("udp", udpAddrStr)
 	if err != nil {
-		log.Fatalf("invalid UDP listen port: %v", err)
+		log.Fatalf("invalid UDP listen address %q: %v", udpAddrStr, err)
 	}
 	udpConn, err := net.ListenUDP("udp", udpListenAddr)
 	if err != nil {
-		log.Fatalf("failed to listen on UDP: %v", err)
+		log.Fatalf("failed to listen on UDP %s: %v", udpAddrStr, err)
 	}
 
-	udpAddrStr := fmt.Sprintf(":%s", *port)
 	webURL := localURL(*webAddr)
 	udpDisplay := udpAddrStr
 	if strings.HasPrefix(udpDisplay, ":") {
@@ -198,17 +201,18 @@ func main() {
 		log.Fatalf("failed to initialize UDP server: %v", err)
 	}
 
-	httpServer := &http.Server{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", wsStreamAudio(recorder, registry, config))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(webpage.IndexHTML))
+	})
+	httpServer := &http.Server{
+		Addr:    *webAddr,
+		Handler: mux,
+	}
 	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/ws", wsStreamAudio(recorder, registry, config))
-		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(webpage.IndexHTML))
-		})
 		log.Printf("HTTP/WebSocket server listening on %s", *webAddr)
-		httpServer.Addr = *webAddr
-		httpServer.Handler = mux
 		if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Printf("HTTP server failed: %v", err)
 		}
@@ -275,7 +279,7 @@ func main() {
 		var rebuild func()
 		var menuCancel context.CancelFunc
 
-		rebuildClients := func() {
+		rebuildClientsLocked := func() {
 			if clientsItem == nil {
 				return
 			}
@@ -284,6 +288,21 @@ func main() {
 				clientsItem.SetTitle("Connected clients: none")
 			} else {
 				clientsItem.SetTitle(fmt.Sprintf("Connected clients (%d)", len(clients)))
+			}
+		}
+
+		rebuildClients := func() {
+			rebuildMu.Lock()
+			item := clientsItem
+			rebuildMu.Unlock()
+			if item == nil {
+				return
+			}
+			clients := registry.List()
+			if len(clients) == 0 {
+				item.SetTitle("Connected clients: none")
+			} else {
+				item.SetTitle(fmt.Sprintf("Connected clients (%d)", len(clients)))
 			}
 		}
 
@@ -312,7 +331,7 @@ func main() {
 
 			clientsItem = systray.AddMenuItem("Connected clients: none", "")
 			clientsItem.Disable()
-			rebuildClients()
+			rebuildClientsLocked()
 
 			devMenu := systray.AddMenuItem("Audio Device", "Choose which output device to loop back, or follow default")
 			autoDev := devMenu.AddSubMenuItemCheckbox("Default (follow)", "", recorder.Device() == "")
@@ -342,7 +361,12 @@ func main() {
 			})
 			onClick(menuCtx, restartItem, func() {
 				recorder.Restart()
-				statusItem.SetTitle(fmt.Sprintf("Status: Running (%s/udp)", udpDisplay))
+				rebuildMu.Lock()
+				sItem := statusItem
+				rebuildMu.Unlock()
+				if sItem != nil {
+					sItem.SetTitle(fmt.Sprintf("Status: Running (%s/udp)", udpDisplay))
+				}
 				rebuildClients()
 			})
 			onClick(menuCtx, quitItem, func() {

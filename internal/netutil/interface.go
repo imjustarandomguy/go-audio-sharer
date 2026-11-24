@@ -1,6 +1,7 @@
 package netutil
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -77,6 +78,13 @@ func FindInterface(name string) (Interface, bool) {
 // DialTarget resolves the server address and picks a target reachable via the
 // given interface. It returns the local address to bind to, and the address to dial.
 func DialTarget(serverAddr string, iface *Interface) (localIP net.IP, target string, err error) {
+	return DialTargetContext(context.Background(), serverAddr, iface)
+}
+
+// DialTargetContext resolves serverAddr honoring ctx cancellation/deadlines.
+// When iface is non-nil and the resolved host is IPv4, localIP is set to
+// iface.IP so outbound sockets bind to that LAN interface.
+func DialTargetContext(ctx context.Context, serverAddr string, iface *Interface) (localIP net.IP, target string, err error) {
 	host, port, err := net.SplitHostPort(serverAddr)
 	if err != nil {
 		return nil, "", fmt.Errorf("invalid server address %q: %w", serverAddr, err)
@@ -87,13 +95,13 @@ func DialTarget(serverAddr string, iface *Interface) (localIP net.IP, target str
 	if parsed := net.ParseIP(host); parsed != nil {
 		ip = parsed
 	} else {
-		addrs, lerr := net.LookupIP(host)
+		addrs, lerr := net.DefaultResolver.LookupIPAddr(ctx, host)
 		if lerr != nil {
 			return nil, "", lerr
 		}
 		if iface != nil {
 			for _, a := range addrs {
-				if ip4 := a.To4(); ip4 != nil && iface.Net.Contains(ip4) {
+				if ip4 := a.IP.To4(); ip4 != nil && iface.Net.Contains(ip4) {
 					ip = ip4
 					break
 				}
@@ -101,18 +109,22 @@ func DialTarget(serverAddr string, iface *Interface) (localIP net.IP, target str
 		}
 		if ip == nil {
 			for _, a := range addrs {
-				if ip4 := a.To4(); ip4 != nil {
+				if ip4 := a.IP.To4(); ip4 != nil {
 					ip = ip4
 					break
 				}
 			}
+		}
+		if ip == nil && len(addrs) > 0 {
+			ip = addrs[0].IP
 		}
 	}
 	if ip == nil {
 		return nil, "", fmt.Errorf("could not resolve server host %q", host)
 	}
 
-	if iface == nil {
+	// Only bind an IPv4 interface localIP when dialing an IPv4 target.
+	if iface == nil || (iface.IP.To4() != nil && ip.To4() == nil) {
 		return nil, net.JoinHostPort(ip.String(), port), nil
 	}
 	return iface.IP, net.JoinHostPort(ip.String(), port), nil
@@ -128,6 +140,7 @@ func DialUDP(localIP net.IP, target string) (*net.UDPConn, error) {
 			network = "udp4"
 			laddr = &net.UDPAddr{IP: ip4}
 		} else {
+			network = "udp6"
 			laddr = &net.UDPAddr{IP: localIP}
 		}
 	}

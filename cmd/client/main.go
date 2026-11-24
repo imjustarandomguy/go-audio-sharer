@@ -254,8 +254,11 @@ func main() {
 		}
 
 		app.SetStatusCallback(func() {
-			if statusItem != nil {
-				statusItem.SetTitle("Status: " + app.Status())
+			rebuildMu.Lock()
+			item := statusItem
+			rebuildMu.Unlock()
+			if item != nil {
+				item.SetTitle("Status: " + app.Status())
 			}
 		})
 

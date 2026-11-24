@@ -25,7 +25,7 @@ type App struct {
 	currentPlayer *audio.Player
 	running       bool
 	cancel        context.CancelFunc
-	wake          chan struct{}
+	loopDone      chan struct{}
 	status        string
 	onState       func()
 }
@@ -112,13 +112,18 @@ func (a *App) Start() {
 	}
 	a.running = true
 	ctx, cancel := context.WithCancel(context.Background())
+	wake := make(chan struct{}, 1)
+	loopDone := make(chan struct{})
 	a.cancel = cancel
-	a.wake = make(chan struct{}, 1)
+	a.loopDone = loopDone
 	a.mu.Unlock()
 
 	a.updateStatus("Connecting")
-	go a.watchInterface(ctx)
-	go a.streamLoop(ctx)
+	go a.watchInterface(ctx, wake)
+	go func() {
+		defer close(loopDone)
+		a.streamLoop(ctx, wake)
+	}()
 }
 
 func (a *App) Stop() {
@@ -129,11 +134,16 @@ func (a *App) Stop() {
 	}
 	a.running = false
 	cancel := a.cancel
+	loopDone := a.loopDone
 	a.cancel = nil
+	a.loopDone = nil
 	a.mu.Unlock()
 
 	if cancel != nil {
 		cancel()
+	}
+	if loopDone != nil {
+		<-loopDone
 	}
 	a.updateStatus("Stopped")
 }
@@ -155,7 +165,7 @@ func (a *App) Reload() {
 	a.updateStatus(a.Status())
 }
 
-func (a *App) streamLoop(ctx context.Context) {
+func (a *App) streamLoop(ctx context.Context, wake <-chan struct{}) {
 	backoff := minBackoff
 	for {
 		if ctx.Err() != nil {
@@ -178,24 +188,26 @@ func (a *App) streamLoop(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				attemptCancel()
+				<-errCh
 				return
-			case <-a.wake:
+			case <-wake:
 				attemptCancel()
+				<-errCh
 				backoff = minBackoff
 				goto nextAttempt
 			case <-resetBackoffCh:
 				// Reset backoff immediately upon streaming active audio
 				backoff = minBackoff
-			case err := <-errCh:
+			case <-errCh:
 				attemptCancel()
-				if err != nil && ctx.Err() != nil {
+				if ctx.Err() != nil {
 					return
 				}
 				a.updateStatus("Reconnecting")
 				select {
 				case <-ctx.Done():
 					return
-				case <-a.wake:
+				case <-wake:
 					backoff = minBackoff
 				case <-time.After(backoff):
 				}
@@ -225,7 +237,9 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 		}
 	}
 
-	localIP, target, err := netutil.DialTarget(server, iface)
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, 5*time.Second)
+	localIP, target, err := netutil.DialTargetContext(dnsCtx, server, iface)
+	dnsCancel()
 	if err != nil {
 		return err
 	}
@@ -242,6 +256,7 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	if err != nil {
 		return err
 	}
+	defer sess.Close()
 
 	cfg := audio.Config{
 		SampleRate:    fmtInfo.SampleRate,
@@ -376,7 +391,7 @@ func (a *App) SetVolume(v float64) {
 
 // watchInterface triggers an immediate reconnect when the preferred interface
 // (re)appears, e.g. when the laptop wakes and the LAN comes back up.
-func (a *App) watchInterface(ctx context.Context) {
+func (a *App) watchInterface(ctx context.Context, wake chan<- struct{}) {
 	a.mu.Lock()
 	ifaceName := a.cfg.Interface
 	a.mu.Unlock()
@@ -394,7 +409,7 @@ func (a *App) watchInterface(ctx context.Context) {
 		_, present := netutil.FindInterface(ifaceName)
 		if present && !prev {
 			select {
-			case a.wake <- struct{}{}:
+			case wake <- struct{}{}:
 			default:
 			}
 		}

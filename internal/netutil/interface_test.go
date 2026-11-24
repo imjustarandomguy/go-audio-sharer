@@ -2,6 +2,7 @@ package netutil
 
 import (
 	"net"
+	"strings"
 	"testing"
 )
 
@@ -78,10 +79,7 @@ func TestFindInterface(t *testing.T) {
 	}
 
 	// Case-insensitive match
-	upper := first.Name
-	if len(upper) > 0 {
-		upper = string(upper[0]-32) + upper[1:] // simple case shift if letter
-	}
+	upper := strings.ToUpper(first.Name)
 	if found, ok := FindInterface(upper); !ok || found.Name != first.Name {
 		t.Errorf("case-insensitive match failed: got %v, %v; want %s", found, ok, first.Name)
 	}

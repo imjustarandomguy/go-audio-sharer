@@ -68,6 +68,7 @@ The server runs on Linux and captures system loopback audio from a PulseAudio or
 | Flag         | Description                                          | Default    |
 |--------------|------------------------------------------------------|------------|
 | `-port`      | UDP port to listen on                                | `5001`     |
+| `-bind`      | Optional IP address to bind the UDP listener to      | (all)      |
 | `-device`    | Audio device to loopback from (substring match)      | (default)  |
 | `-buffer-ms` | Capture buffer size in milliseconds                  | `10`       |
 | `-rate`      | Sample rate in Hz                                    | `48000`    |
