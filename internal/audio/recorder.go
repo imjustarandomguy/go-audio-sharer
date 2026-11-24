@@ -33,6 +33,7 @@ type Recorder struct {
 	opMu        sync.Mutex
 	mu          sync.Mutex
 	isRecording bool
+	closed      bool
 	captureID   malgo.DeviceID
 	bufPool     sync.Pool
 
@@ -138,6 +139,10 @@ func (r *Recorder) startRecording() {
 
 func (r *Recorder) startRecordingLocked() bool {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return false
+	}
 	if r.isRecording {
 		r.mu.Unlock()
 		return true
@@ -273,8 +278,13 @@ func (r *Recorder) Close() {
 	if r.monitor != nil {
 		r.monitor.close()
 	}
-	r.stopRecording()
+	r.opMu.Lock()
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	r.stopRecordingLocked()
 	if r.client != nil {
 		r.client.close()
 	}
+	r.opMu.Unlock()
 }

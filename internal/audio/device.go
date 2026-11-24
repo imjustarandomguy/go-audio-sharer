@@ -311,6 +311,7 @@ type DeviceMonitor struct {
 	filter   string
 	mu       sync.Mutex
 	current  string
+	dirty    bool // true when last onChange failed and must retry even if OS reverts to current
 	onChange func(info *malgo.DeviceInfo) bool
 	stopCh   chan struct{}
 	done     chan struct{}
@@ -380,12 +381,12 @@ func (dm *DeviceMonitor) pollOnce() {
 		dm.mu.Unlock()
 		return
 	}
-	if dm.current == "" {
+	if dm.current == "" && !dm.dirty {
 		dm.current = id
 		dm.mu.Unlock()
 		return
 	}
-	if id == dm.current {
+	if id == dm.current && !dm.dirty {
 		dm.mu.Unlock()
 		return
 	}
@@ -420,27 +421,30 @@ func (dm *DeviceMonitor) pollOnce() {
 	}
 
 	dm.mu.Lock()
-	changed := dm.filter == "" && dm.current != "" && id != dm.current
+	changed := dm.filter == "" && (dm.dirty || (dm.current != "" && id != dm.current))
 	dm.mu.Unlock()
 
 	if !changed {
 		return
 	}
 
-	// Only commit dm.current after onChange reports success, so transient
-	// reopen failures (e.g. Bluetooth/USB switch in progress) automatically
-	// retry on the next poll instead of leaving audio permanently stalled.
+	// Only commit dm.current and clear dirty after onChange reports success,
+	// so transient reopen failures automatically retry on the next poll—even
+	// if the OS falls back to the previous default device.
 	applied := true
 	if dm.onChange != nil {
 		applied = dm.onChange(info)
 	}
-	if applied {
-		dm.mu.Lock()
-		if dm.filter == "" {
+	dm.mu.Lock()
+	if dm.filter == "" {
+		if applied {
 			dm.current = id
+			dm.dirty = false
+		} else {
+			dm.dirty = true
 		}
-		dm.mu.Unlock()
 	}
+	dm.mu.Unlock()
 }
 
 // setFilter updates the device filter. When empty, the monitor follows default
@@ -450,6 +454,7 @@ func (dm *DeviceMonitor) setFilter(filter string) {
 	dm.filter = filter
 	if filter != "" {
 		dm.current = ""
+		dm.dirty = false
 	}
 	dm.mu.Unlock()
 }
@@ -459,6 +464,7 @@ func (dm *DeviceMonitor) setFilter(filter string) {
 func (dm *DeviceMonitor) setCurrent(id string) {
 	dm.mu.Lock()
 	dm.current = id
+	dm.dirty = false
 	dm.mu.Unlock()
 }
 

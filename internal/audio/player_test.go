@@ -376,6 +376,52 @@ func TestPlayerLargeServerChunksNoTrimLoop(t *testing.T) {
 	}
 }
 
+func TestPlayerUDPChunkedPipeWireBurstNoUnderrun(t *testing.T) {
+	// Simulates PipeWire's 1024-frame (21.33 ms = 4096 B) capture quantum sliced
+	// into single-MTU UDP packets (4x960 B + 1x256 B) arriving back-to-back while
+	// the client runs at BufferMs = 10 ms (480-frame callbacks).
+	cfg := Config{
+		SampleRate:    48000,
+		Channels:      2,
+		BitsPerSample: 16,
+		BufferMs:      10,
+	}
+	p := newTestPlayer(cfg)
+	out := make([]byte, 480*4) // 10 ms client callback
+
+	// Pre-buffer 40 ms so initial playback starts, then run 3 seconds of
+	// 21.33 ms PipeWire bursts delivered as 4x960 B + 1x256 B UDP datagrams.
+	writePipeWireBurst := func() {
+		for i := 0; i < 4; i++ {
+			_ = p.Write(makeStereoChunk(240, 2000, -2000)) // 960 B
+		}
+		_ = p.Write(makeStereoChunk(64, 2000, -2000)) // 256 B trailing fragment
+	}
+
+	writePipeWireBurst()
+	writePipeWireBurst()
+	p.onData(out, nil, 480)
+	if !p.pb.playing {
+		t.Fatal("expected player to start playing after initial bursts")
+	}
+
+	var sampleBudget float64
+	for tick := 0; tick < 300; tick++ {
+		sampleBudget += 480.0
+		for sampleBudget >= 1024.0 {
+			sampleBudget -= 1024.0
+			writePipeWireBurst()
+		}
+		p.onData(out, nil, 480)
+		if !p.pb.playing {
+			t.Fatalf("underrun at tick %d under UDP-chunked 1024-frame PipeWire bursts", tick)
+		}
+	}
+	if st := p.TakeStats(); st.Underruns != 0 || st.OverflowTrims != 0 {
+		t.Fatalf("expected 0 underruns and 0 trims, got %+v", st)
+	}
+}
+
 func TestPlayerLargeLatencyDoesNotDeadlock(t *testing.T) {
 	cfg := Config{
 		SampleRate:    48000,

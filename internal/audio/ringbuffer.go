@@ -64,6 +64,11 @@ func (r *byteRingBuffer) Len() int {
 	return int(h - t)
 }
 
+// Head returns the monotonic total number of bytes written by the producer.
+func (r *byteRingBuffer) Head() uint64 {
+	return r.head.Load()
+}
+
 // Cap returns the total buffer capacity in bytes.
 func (r *byteRingBuffer) Cap() int {
 	return len(r.buf)

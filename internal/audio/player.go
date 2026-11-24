@@ -48,6 +48,7 @@ type playbackState struct {
 	phase          float64
 	fillEMA        float64
 	chunkEMA       float64
+	lastHead       uint64
 	integral       float64
 	fadeInRem      int
 	fadeInLen      int
@@ -64,6 +65,7 @@ func (s *playbackState) reset() {
 	s.phase = 0
 	s.fillEMA = 0
 	s.chunkEMA = 0
+	s.lastHead = 0
 	s.integral = 0
 	s.fadeInRem = 0
 	s.fadeInLen = 0
@@ -86,6 +88,7 @@ type Player struct {
 	volumeBits     atomic.Uint64
 	lastWriteBytes atomic.Int64
 	started        bool
+	closed         bool
 	config         Config
 	devID          malgo.DeviceID
 	devName        string
@@ -239,7 +242,7 @@ func (p *Player) Start() error {
 	defer p.opMu.Unlock()
 
 	p.mu.Lock()
-	if p.started {
+	if p.started || p.closed {
 		p.mu.Unlock()
 		return nil
 	}
@@ -278,13 +281,9 @@ func (p *Player) Write(data []byte) error {
 	fb := p.frameBytes()
 	aligned := (len(data) / fb) * fb
 	if aligned > 0 {
-		// Track observed incoming chunk granularity (capped at 100 ms so large
-		// stall bursts don't inflate steady-state latency) to avoid underrun
-		// loops when server chunks are larger than the client's callback period.
-		chunkCap := p.bytesForMs(100)
 		tracked := aligned
-		if chunkCap > 0 && tracked > chunkCap {
-			tracked = chunkCap
+		if cap60 := p.bytesForMs(60); cap60 > 0 && tracked > cap60 {
+			tracked = cap60
 		}
 		p.lastWriteBytes.Store(int64(tracked))
 	}
@@ -369,21 +368,33 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 	}
 	frameBytes := p.frameBytes()
 	targetCushion := p.targetPendingBytes()
+	curHead := p.ring.Head()
 
-	// Smooth observed incoming chunk granularity with the same slow EMA as
-	// fillEMA so transient PipeWire/network chunk fluctuations don't step
-	// targetFrames and cause pitch wobble, while steady-state larger server
-	// chunks are absorbed without underrun or trim loops.
-	if obs := int(p.lastWriteBytes.Load()); obs > 0 {
-		if p.pb.chunkEMA == 0 {
-			p.pb.chunkEMA = float64(obs)
-		} else {
-			p.pb.chunkEMA += driftEMAAlpha * (float64(obs) - p.pb.chunkEMA)
-		}
-	}
+	// During steady playback, measure total bytes arriving between callbacks so
+	// back-to-back single-MTU UDP packets from one capture quantum (e.g. PipeWire
+	// 21.3 ms = 4x960 + 256 B) sum into a single smoothed burst estimate.
+	// During initial prefill, use the observed single-write size so large server
+	// chunks (e.g. 35-60 ms) don't start prematurely on chunk 1.
 	periodBytes := len(out)
-	if smoothed := (int(math.Round(p.pb.chunkEMA)) / frameBytes) * frameBytes; smoothed > periodBytes {
-		periodBytes = smoothed
+	if !p.pb.playing {
+		if obs := int(p.lastWriteBytes.Load()); obs > periodBytes {
+			periodBytes = obs
+		}
+		if smoothed := (int(math.Round(p.pb.chunkEMA)) / frameBytes) * frameBytes; smoothed > periodBytes {
+			periodBytes = smoothed
+		}
+	} else {
+		if curHead > p.pb.lastHead {
+			delta := int(curHead - p.pb.lastHead)
+			if cap60 := p.bytesForMs(60); cap60 > 0 && delta > cap60 {
+				delta = cap60
+			}
+			p.pb.chunkEMA += driftEMAAlpha * (float64(delta) - p.pb.chunkEMA)
+		}
+		p.pb.lastHead = curHead
+		if smoothed := (int(math.Round(p.pb.chunkEMA)) / frameBytes) * frameBytes; smoothed > periodBytes {
+			periodBytes = smoothed
+		}
 	}
 	targetBefore := targetCushion + periodBytes + frameBytes
 
@@ -421,6 +432,10 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		p.pb.playing = true
 		p.pb.hasCurr = false
 		p.pb.phase = 0
+		p.pb.lastHead = curHead
+		if p.pb.chunkEMA == 0 {
+			p.pb.chunkEMA = float64(periodBytes)
+		}
 		p.pb.fillEMA = float64(avail / frameBytes)
 		p.startFadeIn(false)
 	}
@@ -704,7 +719,10 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) bool {
 func (p *Player) Stop() {
 	p.opMu.Lock()
 	defer p.opMu.Unlock()
+	p.stopLocked()
+}
 
+func (p *Player) stopLocked() {
 	p.mu.Lock()
 	if !p.started {
 		p.mu.Unlock()
@@ -739,10 +757,15 @@ func (p *Player) Close() {
 	if p.monitor != nil {
 		p.monitor.close()
 	}
-	p.Stop()
+	p.opMu.Lock()
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	p.stopLocked()
 	if p.ctx != nil {
 		p.ctx.close()
 	}
+	p.opMu.Unlock()
 }
 
 // scaleS16 applies a linear volume to little-endian signed-16 samples in place.

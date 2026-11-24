@@ -149,6 +149,49 @@ func TestDeviceMonitorRetriesFailedOnChange(t *testing.T) {
 	}
 }
 
+func TestDeviceMonitorRetriesAfterFallbackToPreviousDevice(t *testing.T) {
+	devA := fakeDeviceInfo('A')
+	devB := fakeDeviceInfo('B')
+
+	var active atomic.Pointer[malgo.DeviceInfo]
+	active.Store(devB)
+
+	var lastApplied atomic.Pointer[malgo.DeviceInfo]
+	var attempts atomic.Int32
+
+	dm := &DeviceMonitor{
+		pollFn: func() (*malgo.DeviceInfo, error) {
+			return active.Load(), nil
+		},
+		debounce: 5 * time.Millisecond,
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
+		onChange: func(info *malgo.DeviceInfo) bool {
+			if attempts.Add(1) == 1 {
+				// Opening devB fails transiently (old devA was already stopped).
+				return false
+			}
+			lastApplied.Store(info)
+			return true
+		},
+	}
+	dm.setCurrent(devA.ID.String())
+
+	// Poll 1: sees devB, onChange(B) fails -> dirty = true.
+	dm.pollOnce()
+	// OS falls back to devA before next poll.
+	active.Store(devA)
+	// Poll 2: even though devA == dm.current, dirty forces reopen of devA!
+	dm.pollOnce()
+
+	if attempts.Load() != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts.Load())
+	}
+	if got := lastApplied.Load(); got == nil || got.ID != devA.ID {
+		t.Fatalf("expected fallback device A to be reopened, got %v", got)
+	}
+}
+
 func TestDeviceMonitorCloseCancelsMidDebounce(t *testing.T) {
 	devA := fakeDeviceInfo('A')
 	devB := fakeDeviceInfo('B')
