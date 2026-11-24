@@ -2,6 +2,7 @@ package audio
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,6 +18,7 @@ type Broadcaster struct {
 	onStart     func()
 	onStop      func()
 	active      bool
+	dropped     atomic.Uint64
 }
 
 func NewBroadcaster(onStart, onStop func()) *Broadcaster {
@@ -83,6 +85,12 @@ func (b *Broadcaster) HasSubscribers() bool {
 	return len(b.subscribers) > 0
 }
 
+// TakeDropped returns and resets the number of blocks dropped due to slow
+// subscribers since the previous call.
+func (b *Broadcaster) TakeDropped() uint64 {
+	return b.dropped.Swap(0)
+}
+
 func (b *Broadcaster) Broadcast(block CapturedBlock) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -92,6 +100,7 @@ func (b *Broadcaster) Broadcast(block CapturedBlock) {
 		case ch <- block:
 		default:
 			// fast non-blocking drop
+			b.dropped.Add(1)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -292,6 +293,28 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	if err != nil {
 		return err
 	}
+
+	// Periodically log audio glitches (silent when everything is healthy).
+	statsDone := make(chan struct{})
+	defer close(statsDone)
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-statsDone:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				st := p.TakeStats()
+				if st.Underruns > 0 || st.OverflowTrims > 0 || st.RingDrops > 0 || st.DeviceResets > 0 || st.MaxWriteGap >= 50*time.Millisecond {
+					log.Printf("Audio glitches (5s): underruns=%d overflow_trims=%d ring_drops=%d device_resets=%d max_packet_gap=%dms buf=%.1fms",
+						st.Underruns, st.OverflowTrims, st.RingDrops, st.DeviceResets, st.MaxWriteGap.Milliseconds(), p.LatencyMs())
+				}
+			}
+		}
+	}()
 
 	first := true
 	for {

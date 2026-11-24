@@ -239,3 +239,37 @@ func TestPlayerOnDataZeroAllocs(t *testing.T) {
 		t.Fatalf("expected 0 allocs/run in steady-state Write+onData, got %.2f", allocs)
 	}
 }
+
+func TestPlayerStatsTracking(t *testing.T) {
+	cfg := Config{
+		SampleRate:    48000,
+		Channels:      2,
+		BitsPerSample: 16,
+		BufferMs:      10,
+	}
+	p := newTestPlayer(cfg)
+	out := make([]byte, 480*4)
+
+	// Trigger an overflow trim.
+	_ = p.Write(makeStereoChunk((p.maxPendingBytes()/4)+1000, 100, -100))
+	p.onData(out, nil, 480)
+
+	// Drain until underrun.
+	for i := 0; i < 6; i++ {
+		p.onData(out, nil, 480)
+	}
+
+	st := p.TakeStats()
+	if st.OverflowTrims != 1 {
+		t.Errorf("OverflowTrims = %d, want 1", st.OverflowTrims)
+	}
+	if st.Underruns == 0 {
+		t.Errorf("expected Underruns > 0, got 0")
+	}
+
+	// Second TakeStats must return zeroed counters.
+	st2 := p.TakeStats()
+	if st2.OverflowTrims != 0 || st2.Underruns != 0 {
+		t.Errorf("expected stats to reset after TakeStats, got %+v", st2)
+	}
+}

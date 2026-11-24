@@ -7,9 +7,19 @@ import (
 	"math"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/gen2brain/malgo"
 )
+
+// PlayerStats reports glitch telemetry collected since the previous TakeStats call.
+type PlayerStats struct {
+	Underruns     uint64
+	OverflowTrims uint64
+	RingDrops     uint64
+	DeviceResets  uint64
+	MaxWriteGap   time.Duration
+}
 
 const (
 	maxResampleChannels = 8
@@ -73,6 +83,37 @@ type Player struct {
 
 	// Consumer-only state (only touched in onData or after device.Stop()).
 	pb playbackState
+
+	// Atomic glitch telemetry counters (safe from audio callback and network goroutine).
+	underruns     atomic.Uint64
+	overflowTrims atomic.Uint64
+	ringDrops     atomic.Uint64
+	deviceResets  atomic.Uint64
+	lastWriteNs   atomic.Int64
+	maxWriteGapNs atomic.Int64
+}
+
+func recordMaxInt64(dst *atomic.Int64, val int64) {
+	for {
+		cur := dst.Load()
+		if val <= cur {
+			return
+		}
+		if dst.CompareAndSwap(cur, val) {
+			return
+		}
+	}
+}
+
+// TakeStats returns and resets glitch telemetry collected since the last call.
+func (p *Player) TakeStats() PlayerStats {
+	return PlayerStats{
+		Underruns:     p.underruns.Swap(0),
+		OverflowTrims: p.overflowTrims.Swap(0),
+		RingDrops:     p.ringDrops.Swap(0),
+		DeviceResets:  p.deviceResets.Swap(0),
+		MaxWriteGap:   time.Duration(p.maxWriteGapNs.Swap(0)),
+	}
 }
 
 func NewPlayer(cfg Config) (*Player, error) {
@@ -189,7 +230,16 @@ func (p *Player) frameBytes() int {
 }
 
 func (p *Player) Write(data []byte) error {
-	p.ring.WriteAligned(data, p.frameBytes())
+	now := time.Now().UnixNano()
+	if prev := p.lastWriteNs.Swap(now); prev > 0 && now > prev {
+		recordMaxInt64(&p.maxWriteGapNs, now-prev)
+	}
+	fb := p.frameBytes()
+	aligned := (len(data) / fb) * fb
+	written := p.ring.WriteAligned(data, fb)
+	if written < aligned {
+		p.ringDrops.Add(1)
+	}
 	return nil
 }
 
@@ -310,6 +360,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		avail = p.ring.Len() + (p.pb.scratchLen - p.pb.scratchOff)
 		p.pb.fillEMA = float64(avail / frameBytes)
 		p.startFadeIn()
+		p.overflowTrims.Add(1)
 	}
 
 	vol := math.Float64frombits(p.volumeBits.Load())
@@ -321,7 +372,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		}
 		clear(out[n:])
 		if n < len(out) {
-			p.pb.playing = false
+			p.enterUnderrun()
 		}
 		return
 	}
@@ -422,6 +473,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 }
 
 func (p *Player) enterUnderrun() {
+	p.underruns.Add(1)
 	p.pb.playing = false
 	p.pb.hasCurr = false
 	p.pb.phase = 0
@@ -512,6 +564,8 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 	p.devID = info.ID
 	p.devName = info.Name()
 	p.mu.Unlock()
+
+	p.deviceResets.Add(1)
 
 	// Stop old device before resetting the SPSC ring buffer and consumer state
 	// so onData is no longer running.

@@ -273,10 +273,34 @@ func main() {
 		}
 	}()
 
+	// Periodically log capture/broadcast glitches (silent when healthy).
+	statsStop := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-statsStop:
+				return
+			case <-ticker.C:
+				st := recorder.TakeStats()
+				if st.DroppedBlocks > 0 || st.MaxCaptureGap >= 50*time.Millisecond {
+					log.Printf("Capture glitches (5s): dropped_blocks=%d max_capture_gap=%dms clients=%d",
+						st.DroppedBlocks, st.MaxCaptureGap.Milliseconds(), registry.Count())
+				}
+			}
+		}
+	}()
+
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	shutdown := func() {
+		select {
+		case <-statsStop:
+		default:
+			close(statsStop)
+		}
 		// Use Stop(), not GracefulStop(): GracefulStop waits for active streaming
 		// RPCs (GetStream), which never end while a client stays connected.
 		grpcServer.Stop()

@@ -3,10 +3,18 @@ package audio
 import (
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gen2brain/malgo"
 )
+
+// RecorderStats reports capture and broadcast glitch telemetry collected since
+// the previous TakeStats call.
+type RecorderStats struct {
+	DroppedBlocks uint64
+	MaxCaptureGap time.Duration
+}
 
 type Config struct {
 	SampleRate    int
@@ -26,6 +34,9 @@ type Recorder struct {
 	mu          sync.Mutex
 	isRecording bool
 	captureID   malgo.DeviceID
+
+	lastCaptureNs   atomic.Int64
+	maxCaptureGapNs atomic.Int64
 }
 
 func NewRecorder(cfg Config) (*Recorder, error) {
@@ -182,9 +193,21 @@ func (r *Recorder) startRecordingLocked() {
 	log.Println("Started loopback capture")
 }
 
+// TakeStats returns and resets capture glitch telemetry collected since the last call.
+func (r *Recorder) TakeStats() RecorderStats {
+	return RecorderStats{
+		DroppedBlocks: r.broadcaster.TakeDropped(),
+		MaxCaptureGap: time.Duration(r.maxCaptureGapNs.Swap(0)),
+	}
+}
+
 func (r *Recorder) onData(_, in []byte, framecount uint32) {
 	if len(in) == 0 {
 		return
+	}
+	now := time.Now().UnixNano()
+	if prev := r.lastCaptureNs.Swap(now); prev > 0 && now > prev {
+		recordMaxInt64(&r.maxCaptureGapNs, now-prev)
 	}
 	block := make([]byte, len(in))
 	copy(block, in)
@@ -210,6 +233,7 @@ func (r *Recorder) stopRecordingLocked() {
 	if stream != nil {
 		_ = stream.Stop()
 		stream.Uninit()
+		r.lastCaptureNs.Store(0)
 		log.Println("Stopped loopback capture")
 	}
 }
