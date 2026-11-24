@@ -189,11 +189,14 @@ func main() {
 	defer recorder.Close()
 
 	registry := server.NewConnRegistry()
-	udpServer := udpstream.NewServer(udpConn, recorder, udpstream.Format{
+	udpServer, err := udpstream.NewServer(udpConn, recorder, udpstream.Format{
 		SampleRate:    config.SampleRate,
 		Channels:      config.Channels,
 		BitsPerSample: config.BitsPerSample,
 	}, registry)
+	if err != nil {
+		log.Fatalf("failed to initialize UDP server: %v", err)
+	}
 
 	httpServer := &http.Server{}
 	go func() {

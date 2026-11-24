@@ -93,7 +93,9 @@ func DecodeControl(b []byte) (pktType uint8, clientID uint64, ok bool) {
 }
 
 // EncodeDataHeader writes a 16-byte AUDIO or ACK header into dst and returns DataHeaderSize.
-func EncodeDataHeader(dst []byte, pktType uint8, seq uint32, f Format) int {
+// Bytes [14:16] carry a per-server-instance boot epoch so clients seamlessly
+// resync sequence numbers if the server restarts mid-session.
+func EncodeDataHeader(dst []byte, pktType uint8, seq uint32, epoch uint16, f Format) int {
 	dst[0] = Magic0
 	dst[1] = Magic1
 	dst[2] = ProtocolVersion
@@ -102,20 +104,19 @@ func EncodeDataHeader(dst []byte, pktType uint8, seq uint32, f Format) int {
 	binary.LittleEndian.PutUint32(dst[8:12], uint32(f.SampleRate))
 	dst[12] = uint8(f.Channels)
 	dst[13] = uint8(f.BitsPerSample)
-	dst[14] = 0
-	dst[15] = 0
+	binary.LittleEndian.PutUint16(dst[14:16], epoch)
 	return DataHeaderSize
 }
 
 // DecodeDataPacket parses a server AUDIO or ACK datagram without allocating.
 // The returned payload slice aliases b.
-func DecodeDataPacket(b []byte) (pktType uint8, seq uint32, f Format, payload []byte, ok bool) {
+func DecodeDataPacket(b []byte) (pktType uint8, seq uint32, epoch uint16, f Format, payload []byte, ok bool) {
 	if len(b) < DataHeaderSize || b[0] != Magic0 || b[1] != Magic1 || b[2] != ProtocolVersion {
-		return 0, 0, Format{}, nil, false
+		return 0, 0, 0, Format{}, nil, false
 	}
 	pktType = b[3]
 	if pktType != TypeAudio && pktType != TypeAck {
-		return 0, 0, Format{}, nil, false
+		return 0, 0, 0, Format{}, nil, false
 	}
 	seq = binary.LittleEndian.Uint32(b[4:8])
 	f = Format{
@@ -123,8 +124,9 @@ func DecodeDataPacket(b []byte) (pktType uint8, seq uint32, f Format, payload []
 		Channels:      int(b[12]),
 		BitsPerSample: int(b[13]),
 	}
+	epoch = binary.LittleEndian.Uint16(b[14:16])
 	if !f.Valid() {
-		return 0, 0, Format{}, nil, false
+		return 0, 0, 0, Format{}, nil, false
 	}
-	return pktType, seq, f, b[DataHeaderSize:], true
+	return pktType, seq, epoch, f, b[DataHeaderSize:], true
 }

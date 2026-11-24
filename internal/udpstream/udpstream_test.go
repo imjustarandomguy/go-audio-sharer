@@ -34,6 +34,15 @@ func (m *mockAudioSource) Unsubscribe(ch chan audio.CapturedBlock) { m.b.Unsubsc
 func (m *mockAudioSource) Push(data []byte)                        { m.b.Broadcast(audio.CapturedBlock{Data: data}) }
 func (m *mockAudioSource) HasSubscribers() bool                    { return m.b.HasSubscribers() }
 
+func mustNewServer(t *testing.T, conn *net.UDPConn, src AudioSource, f Format, reg *server.ConnRegistry) *Server {
+	t.Helper()
+	srv, err := NewServer(conn, src, f, reg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	return srv
+}
+
 func TestPacketCodecRoundTrip(t *testing.T) {
 	var ctrl [ControlSize]byte
 	n := EncodeControl(ctrl[:], TypeHello, 0x123456789abcdef0)
@@ -58,17 +67,41 @@ func TestPacketCodecRoundTrip(t *testing.T) {
 	}
 
 	buf := make([]byte, DataHeaderSize+8)
-	EncodeDataHeader(buf, TypeAudio, 42, f)
+	EncodeDataHeader(buf, TypeAudio, 42, 0xBEEF, f)
 	copy(buf[DataHeaderSize:], []byte("12345678"))
-	dpt, seq, df, payload, ok := DecodeDataPacket(buf)
-	if !ok || dpt != TypeAudio || seq != 42 || df != f || string(payload) != "12345678" {
-		t.Fatalf("DecodeDataPacket = (%d, %d, %+v, %q, %v)", dpt, seq, df, payload, ok)
+	dpt, seq, epoch, df, payload, ok := DecodeDataPacket(buf)
+	if !ok || dpt != TypeAudio || seq != 42 || epoch != 0xBEEF || df != f || string(payload) != "12345678" {
+		t.Fatalf("DecodeDataPacket = (%d, %d, %x, %+v, %q, %v)", dpt, seq, epoch, df, payload, ok)
 	}
 
 	// Invalid format (0 channels) must be rejected.
 	buf[12] = 0
-	if _, _, _, _, ok := DecodeDataPacket(buf); ok {
+	if _, _, _, _, _, ok := DecodeDataPacket(buf); ok {
 		t.Fatal("expected invalid format (0 channels) to be rejected")
+	}
+}
+
+func TestServerRejectsInvalidFormat(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer conn.Close()
+
+	if _, err := NewServer(conn, newMockAudioSource(), Format{SampleRate: 0, Channels: 2, BitsPerSample: 16}, nil); err == nil {
+		t.Fatal("expected error for invalid format")
+	}
+}
+
+func TestServerCloseBeforeServeDoesNotRace(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	srv := mustNewServer(t, conn, newMockAudioSource(), Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, nil)
+	srv.Close()
+	if err := srv.Serve(); err != nil {
+		t.Fatalf("Serve after Close returned %v, want nil", err)
 	}
 }
 
@@ -81,7 +114,7 @@ func TestServerClientEndToEndAndMTUChunking(t *testing.T) {
 	reg := server.NewConnRegistry()
 	fmtCfg := Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}
 
-	srv := NewServer(srvConn, src, fmtCfg, reg)
+	srv := mustNewServer(t, srvConn, src, fmtCfg, reg)
 	srvDone := make(chan struct{})
 	go func() {
 		defer close(srvDone)
@@ -199,8 +232,6 @@ func TestClientDropsStaleAndTracksPacketLoss(t *testing.T) {
 
 	f := Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}
 
-	// Custom server goroutine: answer HELLO with ACK, then send crafted sequence numbers
-	// including uint32 wrap-around, a duplicate/stale packet, and a 3-packet gap.
 	go func() {
 		buf := make([]byte, 64)
 		_, raddr, err := srvConn.ReadFromUDP(buf)
@@ -208,12 +239,12 @@ func TestClientDropsStaleAndTracksPacketLoss(t *testing.T) {
 			return
 		}
 		var hdr [DataHeaderSize]byte
-		EncodeDataHeader(hdr[:], TypeAck, 0, f)
+		EncodeDataHeader(hdr[:], TypeAck, 0, 7, f)
 		_, _ = srvConn.WriteToUDP(hdr[:], raddr)
 
 		sendPkt := func(seq uint32, tag byte) {
 			p := make([]byte, DataHeaderSize+4)
-			EncodeDataHeader(p, TypeAudio, seq, f)
+			EncodeDataHeader(p, TypeAudio, seq, 7, f)
 			p[DataHeaderSize] = tag
 			_, _ = srvConn.WriteToUDP(p, raddr)
 		}
@@ -255,6 +286,185 @@ func TestClientDropsStaleAndTracksPacketLoss(t *testing.T) {
 	}
 }
 
+func TestClientResyncsOnServerRestartEpochChange(t *testing.T) {
+	srvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer srvConn.Close()
+
+	cliConn, err := net.DialUDP("udp4", nil, srvConn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer cliConn.Close()
+
+	f := Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}
+
+	go func() {
+		buf := make([]byte, 64)
+		_, raddr, err := srvConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		var hdr [DataHeaderSize]byte
+		EncodeDataHeader(hdr[:], TypeAck, 0, 10, f)
+		_, _ = srvConn.WriteToUDP(hdr[:], raddr)
+
+		sendPkt := func(seq uint32, epoch uint16, tag byte) {
+			p := make([]byte, DataHeaderSize+4)
+			EncodeDataHeader(p, TypeAudio, seq, epoch, f)
+			p[DataHeaderSize] = tag
+			_, _ = srvConn.WriteToUDP(p, raddr)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+		// Server running at seq=120000 with epoch=10.
+		sendPkt(120000, 10, 'A')
+		// Server restarts with new epoch=11 and seq reset to 1, 2.
+		sendPkt(1, 11, 'B')
+		sendPkt(2, 11, 'C')
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	sess, _, err := Handshake(ctx, cliConn, time.Second)
+	if err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+	var gotTags []byte
+	err = sess.Run(ctx, func(pcm []byte) error {
+		gotTags = append(gotTags, pcm[0])
+		if len(gotTags) == 3 {
+			cancel()
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if string(gotTags) != "ABC" {
+		t.Fatalf("got tags %q, want ABC", string(gotTags))
+	}
+	if st := sess.TakeStats(); st.OutOfOrder != 0 {
+		t.Fatalf("expected 0 out-of-order drops on epoch change, got %d", st.OutOfOrder)
+	}
+}
+
+func TestClientResyncsOnSameEpochMonotonicReset(t *testing.T) {
+	srvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer srvConn.Close()
+
+	cliConn, err := net.DialUDP("udp4", nil, srvConn.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer cliConn.Close()
+
+	f := Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}
+
+	go func() {
+		buf := make([]byte, 64)
+		_, raddr, err := srvConn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		var hdr [DataHeaderSize]byte
+		EncodeDataHeader(hdr[:], TypeAck, 0, 42, f)
+		_, _ = srvConn.WriteToUDP(hdr[:], raddr)
+
+		sendPkt := func(seq uint32, tag byte) {
+			p := make([]byte, DataHeaderSize+4)
+			EncodeDataHeader(p, TypeAudio, seq, 42, f)
+			p[DataHeaderSize] = tag
+			_, _ = srvConn.WriteToUDP(p, raddr)
+		}
+
+		time.Sleep(20 * time.Millisecond)
+		sendPkt(120000, 'A')
+		// Same epoch=42 but seq resets to 1..6; after 5 consecutive monotonic packets
+		// the belt-and-suspenders resync must recover automatically.
+		for i := uint32(1); i <= 6; i++ {
+			sendPkt(i, byte('0'+i))
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	sess, _, err := Handshake(ctx, cliConn, time.Second)
+	if err != nil {
+		t.Fatalf("Handshake: %v", err)
+	}
+	var gotTags []byte
+	err = sess.Run(ctx, func(pcm []byte) error {
+		gotTags = append(gotTags, pcm[0])
+		if len(gotTags) == 3 {
+			cancel()
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if string(gotTags) != "A56" {
+		t.Fatalf("got tags %q, want A56 (resync on 5th monotonic packet)", string(gotTags))
+	}
+}
+
+func TestHandshakeRetriesPastICMPConnectionRefused(t *testing.T) {
+	// Grab an ephemeral port and close it immediately so the first HELLO gets
+	// ICMP Port Unreachable (ECONNREFUSED on Linux / WSAECONNRESET on Windows).
+	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP probe: %v", err)
+	}
+	addr := probe.LocalAddr().(*net.UDPAddr)
+	probe.Close()
+
+	cliConn, err := net.DialUDP("udp4", nil, addr)
+	if err != nil {
+		t.Fatalf("DialUDP: %v", err)
+	}
+	defer cliConn.Close()
+
+	// Start the server 150 ms later on the same port.
+	srvReady := make(chan *Server, 1)
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		srvConn, err := net.ListenUDP("udp4", addr)
+		if err != nil {
+			return
+		}
+		srv := mustNewServer(t, srvConn, newMockAudioSource(), Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, nil)
+		srvReady <- srv
+		_ = srv.Serve()
+	}()
+	defer func() {
+		select {
+		case srv := <-srvReady:
+			srv.Close()
+		default:
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	sess, f, err := Handshake(ctx, cliConn, 2*time.Second)
+	if err != nil {
+		t.Fatalf("Handshake failed instead of retrying past ICMP refused: %v", err)
+	}
+	sess.Close()
+	if f.SampleRate != 48000 {
+		t.Fatalf("format = %+v, want 48000 Hz", f)
+	}
+}
+
 func TestClientDetectsFormatChange(t *testing.T) {
 	srvConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -278,10 +488,10 @@ func TestClientDetectsFormatChange(t *testing.T) {
 			return
 		}
 		var pkt [DataHeaderSize + 4]byte
-		EncodeDataHeader(pkt[:], TypeAck, 0, f1)
+		EncodeDataHeader(pkt[:], TypeAck, 0, 1, f1)
 		_, _ = srvConn.WriteToUDP(pkt[:DataHeaderSize], raddr)
 		time.Sleep(20 * time.Millisecond)
-		EncodeDataHeader(pkt[:], TypeAudio, 1, f2)
+		EncodeDataHeader(pkt[:], TypeAudio, 1, 1, f2)
 		_, _ = srvConn.WriteToUDP(pkt[:], raddr)
 	}()
 
@@ -305,7 +515,7 @@ func TestServerReapsTimedOutPeer(t *testing.T) {
 	}
 	src := newMockAudioSource()
 	reg := server.NewConnRegistry()
-	srv := NewServer(srvConn, src, Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, reg)
+	srv := mustNewServer(t, srvConn, src, Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, reg)
 	srv.peerTimeout = 80 * time.Millisecond
 	srv.reapInterval = 20 * time.Millisecond
 
@@ -357,7 +567,7 @@ func TestClientIdleKeepaliveSurvivesSilence(t *testing.T) {
 		t.Fatalf("ListenUDP: %v", err)
 	}
 	src := newMockAudioSource()
-	srv := NewServer(srvConn, src, Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, nil)
+	srv := mustNewServer(t, srvConn, src, Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, nil)
 	srvDone := make(chan struct{})
 	go func() {
 		defer close(srvDone)
@@ -400,7 +610,7 @@ func TestServerByeWithWrongClientIDIgnored(t *testing.T) {
 	}
 	src := newMockAudioSource()
 	reg := server.NewConnRegistry()
-	srv := NewServer(srvConn, src, Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, reg)
+	srv := mustNewServer(t, srvConn, src, Format{SampleRate: 48000, Channels: 2, BitsPerSample: 16}, reg)
 	srvDone := make(chan struct{})
 	go func() {
 		defer close(srvDone)

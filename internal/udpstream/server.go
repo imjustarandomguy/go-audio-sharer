@@ -1,7 +1,10 @@
 package udpstream
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"sync"
@@ -15,6 +18,7 @@ import (
 const (
 	defaultPeerTimeout  = 6 * time.Second
 	defaultReapInterval = 1 * time.Second
+	defaultMaxPeers     = 64
 	socketBufferBytes   = 256 * 1024
 )
 
@@ -37,9 +41,11 @@ type Server struct {
 	src      AudioSource
 	format   Format
 	registry *server.ConnRegistry
+	epoch    uint16
 
 	peerTimeout  time.Duration
 	reapInterval time.Duration
+	maxPeers     int
 
 	mu     sync.RWMutex
 	peers  map[string]*udpPeer
@@ -54,8 +60,21 @@ type Server struct {
 	once   sync.Once
 }
 
+func randomEpoch() uint16 {
+	var b [2]byte
+	_, _ = rand.Read(b[:])
+	e := binary.LittleEndian.Uint16(b[:])
+	if e == 0 {
+		e = 1
+	}
+	return e
+}
+
 // NewServer creates a UDP audio streaming server bound to conn.
-func NewServer(conn *net.UDPConn, src AudioSource, format Format, registry *server.ConnRegistry) *Server {
+func NewServer(conn *net.UDPConn, src AudioSource, format Format, registry *server.ConnRegistry) (*Server, error) {
+	if !format.Valid() {
+		return nil, fmt.Errorf("invalid audio format: %+v", format)
+	}
 	_ = conn.SetWriteBuffer(socketBufferBytes)
 	_ = conn.SetReadBuffer(socketBufferBytes)
 	return &Server{
@@ -63,17 +82,27 @@ func NewServer(conn *net.UDPConn, src AudioSource, format Format, registry *serv
 		src:          src,
 		format:       format,
 		registry:     registry,
+		epoch:        randomEpoch(),
 		peerTimeout:  defaultPeerTimeout,
 		reapInterval: defaultReapInterval,
+		maxPeers:     defaultMaxPeers,
 		peers:        make(map[string]*udpPeer),
 		stopCh:       make(chan struct{}),
-	}
+	}, nil
 }
 
 // Serve handles incoming client HELLO/BYE packets and fans out audio until
 // Close is called.
 func (s *Server) Serve() error {
+	// Register reapLoop under s.mu after checking s.closed so Close() calling
+	// s.wg.Wait() can never race with s.wg.Add(1).
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
 	s.wg.Add(1)
+	s.mu.Unlock()
 	go s.reapLoop()
 
 	buf := make([]byte, 64)
@@ -89,7 +118,12 @@ func (s *Server) Serve() error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			// Ignore transient ICMP / read errors on UDP sockets and keep serving.
+			// Brief backoff so a persistent OS socket error cannot spin CPU at 100%.
+			select {
+			case <-s.stopCh:
+				return nil
+			case <-time.After(10 * time.Millisecond):
+			}
 			continue
 		}
 
@@ -109,6 +143,7 @@ func (s *Server) Serve() error {
 
 func (s *Server) handleHello(raddr *net.UDPAddr, clientID uint64, ackBuf *[DataHeaderSize]byte) {
 	key := raddr.String()
+	regKey := "udp:" + key
 	now := time.Now()
 
 	s.mu.Lock()
@@ -118,6 +153,10 @@ func (s *Server) handleHello(raddr *net.UDPAddr, clientID uint64, ackBuf *[DataH
 	}
 	existing, exists := s.peers[key]
 	if !exists {
+		if s.maxPeers > 0 && len(s.peers) >= s.maxPeers {
+			s.mu.Unlock()
+			return
+		}
 		addrCopy := *raddr
 		if raddr.IP != nil {
 			addrCopy.IP = append(net.IP(nil), raddr.IP...)
@@ -127,6 +166,9 @@ func (s *Server) handleHello(raddr *net.UDPAddr, clientID uint64, ackBuf *[DataH
 			clientID: clientID,
 			lastSeen: now,
 		}
+		if s.registry != nil {
+			s.registry.Add(regKey)
+		}
 	} else {
 		existing.clientID = clientID
 		existing.lastSeen = now
@@ -135,20 +177,18 @@ func (s *Server) handleHello(raddr *net.UDPAddr, clientID uint64, ackBuf *[DataH
 
 	if !exists {
 		log.Printf("UDP client connected: %s", key)
-		if s.registry != nil {
-			s.registry.Add(key)
-		}
 		s.reconcileSub()
 	}
 
 	// Reply immediately with format ACK so clients connect even when audio is silent
 	// and idle keepalives reset the client read deadline.
-	EncodeDataHeader(ackBuf[:], TypeAck, 0, s.format)
+	EncodeDataHeader(ackBuf[:], TypeAck, 0, s.epoch, s.format)
 	_, _ = s.conn.WriteToUDP(ackBuf[:], raddr)
 }
 
 func (s *Server) handleBye(raddr *net.UDPAddr, clientID uint64) {
 	key := raddr.String()
+	regKey := "udp:" + key
 
 	s.mu.Lock()
 	peer, exists := s.peers[key]
@@ -157,13 +197,13 @@ func (s *Server) handleBye(raddr *net.UDPAddr, clientID uint64) {
 		return
 	}
 	delete(s.peers, key)
+	if s.registry != nil {
+		s.registry.Remove(regKey)
+	}
 	empty := len(s.peers) == 0
 	s.mu.Unlock()
 
 	log.Printf("UDP client disconnected: %s", key)
-	if s.registry != nil {
-		s.registry.Remove(key)
-	}
 	if empty {
 		s.reconcileSub()
 	}
@@ -185,6 +225,9 @@ func (s *Server) reapLoop() {
 			for key, peer := range s.peers {
 				if now.Sub(peer.lastSeen) > s.peerTimeout {
 					delete(s.peers, key)
+					if s.registry != nil {
+						s.registry.Remove("udp:" + key)
+					}
 					expired = append(expired, key)
 				}
 			}
@@ -193,9 +236,6 @@ func (s *Server) reapLoop() {
 
 			for _, key := range expired {
 				log.Printf("UDP client timed out: %s", key)
-				if s.registry != nil {
-					s.registry.Remove(key)
-				}
 			}
 			if len(expired) > 0 && empty {
 				s.reconcileSub()
@@ -262,7 +302,7 @@ func (s *Server) sendLoop(ch chan audio.CapturedBlock) {
 				end = dataLen
 			}
 			seq := s.seq.Add(1)
-			EncodeDataHeader(pktBuf, TypeAudio, seq, s.format)
+			EncodeDataHeader(pktBuf, TypeAudio, seq, s.epoch, s.format)
 			n := copy(pktBuf[DataHeaderSize:], data[off:end])
 			pkt := pktBuf[:DataHeaderSize+n]
 
@@ -279,20 +319,15 @@ func (s *Server) sendLoop(ch chan audio.CapturedBlock) {
 // clients from the registry, and waits for all background goroutines to exit.
 func (s *Server) Close() {
 	s.once.Do(func() {
-		var keys []string
 		s.mu.Lock()
 		s.closed = true
 		for k := range s.peers {
-			keys = append(keys, k)
 			delete(s.peers, k)
-		}
-		s.mu.Unlock()
-
-		for _, k := range keys {
 			if s.registry != nil {
-				s.registry.Remove(k)
+				s.registry.Remove("udp:" + k)
 			}
 		}
+		s.mu.Unlock()
 
 		close(s.stopCh)
 		_ = s.conn.Close()
