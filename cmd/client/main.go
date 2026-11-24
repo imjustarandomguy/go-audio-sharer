@@ -95,7 +95,13 @@ func main() {
 		cfg.Device = *device
 	}
 	if *latency != 0 {
-		cfg.LatencyMs = *latency
+		l := *latency
+		if l < 5 {
+			l = 5
+		} else if l > 500 {
+			l = 500
+		}
+		cfg.LatencyMs = l
 	}
 	cfg.AutoConnect = *autoConnect && cfg.AutoConnect
 

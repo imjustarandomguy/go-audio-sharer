@@ -38,28 +38,33 @@ const (
 // playbackState holds consumer-only state accessed exclusively from the
 // miniaudio real-time audio callback (or after device.Stop()).
 type playbackState struct {
-	playing    bool
-	hasCurr    bool
-	prevFrame  [maxResampleChannels]int16
-	currFrame  [maxResampleChannels]int16
-	phase      float64
-	fillEMA    float64
-	integral   float64
-	fadeInRem  int
-	fadeInLen  int
-	scratch    []byte
-	scratchOff int
-	scratchLen int
+	playing      bool
+	hasCurr      bool
+	hasLastOut   bool
+	prevFrame    [maxResampleChannels]int16
+	currFrame    [maxResampleChannels]int16
+	lastOutFrame [maxResampleChannels]int16
+	phase        float64
+	fillEMA      float64
+	integral     float64
+	fadeInRem    int
+	fadeInLen    int
+	fadeFromLast bool
+	scratch      []byte
+	scratchOff   int
+	scratchLen   int
 }
 
 func (s *playbackState) reset() {
 	s.playing = false
 	s.hasCurr = false
+	s.hasLastOut = false
 	s.phase = 0
 	s.fillEMA = 0
 	s.integral = 0
 	s.fadeInRem = 0
 	s.fadeInLen = 0
+	s.fadeFromLast = false
 	s.scratchOff = 0
 	s.scratchLen = 0
 }
@@ -72,14 +77,15 @@ type Player struct {
 	device  *malgo.Device
 	monitor *DeviceMonitor
 
-	opMu       sync.Mutex
-	mu         sync.Mutex
-	ring       *byteRingBuffer
-	volumeBits atomic.Uint64
-	started    bool
-	config     Config
-	devID      malgo.DeviceID
-	devName    string
+	opMu           sync.Mutex
+	mu             sync.Mutex
+	ring           *byteRingBuffer
+	volumeBits     atomic.Uint64
+	lastWriteBytes atomic.Int64
+	started        bool
+	config         Config
+	devID          malgo.DeviceID
+	devName        string
 
 	// Consumer-only state (only touched in onData or after device.Stop()).
 	pb playbackState
@@ -124,10 +130,14 @@ func NewPlayer(cfg Config) (*Player, error) {
 	p := &Player{
 		ctx:    ctx,
 		config: cfg,
-		ring:   newByteRingBuffer(512 * 1024), // 512 KB (~2.7s headroom at 48kHz stereo)
 	}
+	ringCap := 512 * 1024 // 512 KB (~2.7s headroom at 48kHz stereo)
+	if need := p.maxPendingBytes() * 4; need > ringCap {
+		ringCap = need
+	}
+	p.ring = newByteRingBuffer(ringCap)
 	p.volumeBits.Store(math.Float64bits(1.0))
-	p.pb.scratch = make([]byte, 16*1024)
+	p.pb.scratch = make([]byte, 64*1024)
 	p.monitor = newDeviceMonitor(cfg.Device, func(info *malgo.DeviceInfo) {
 		p.followDefault(info)
 	})
@@ -236,6 +246,17 @@ func (p *Player) Write(data []byte) error {
 	}
 	fb := p.frameBytes()
 	aligned := (len(data) / fb) * fb
+	if aligned > 0 {
+		// Track observed incoming chunk granularity (capped at 50 ms so burst
+		// writes don't inflate steady-state latency) to avoid underrun loops
+		// when server chunks are larger than the client's callback period.
+		chunkCap := p.bytesForMs(50)
+		tracked := aligned
+		if chunkCap > 0 && tracked > chunkCap {
+			tracked = chunkCap
+		}
+		p.lastWriteBytes.Store(int64(tracked))
+	}
 	written := p.ring.WriteAligned(data, fb)
 	if written < aligned {
 		p.ringDrops.Add(1)
@@ -243,20 +264,24 @@ func (p *Player) Write(data []byte) error {
 	return nil
 }
 
+func (p *Player) bytesForMs(ms int) int {
+	frameBytes := p.frameBytes()
+	bytesPerSec := p.config.SampleRate * frameBytes
+	if bytesPerSec <= 0 || ms <= 0 {
+		return 0
+	}
+	raw := (bytesPerSec * ms) / 1000
+	return (raw / frameBytes) * frameBytes
+}
+
 // targetPendingBytes returns the desired jitter-buffer cushion (in bytes)
 // maintained after each audio callback drains a period.
 func (p *Player) targetPendingBytes() int {
-	frameBytes := p.frameBytes()
-	bytesPerSec := p.config.SampleRate * frameBytes
-	if bytesPerSec <= 0 {
-		return 0
-	}
 	ms := p.config.BufferMs
 	if ms <= 0 {
 		ms = 10
 	}
-	raw := (bytesPerSec * ms) / 1000
-	return (raw / frameBytes) * frameBytes
+	return p.bytesForMs(ms)
 }
 
 // maxPendingBytes is the upper bound for buffered PCM before hard trimming.
@@ -280,8 +305,7 @@ func (p *Player) maxPendingBytes() int {
 	if maxMs < 50 {
 		maxMs = 50
 	}
-	raw := (bytesPerSec * maxMs) / 1000
-	return (raw / frameBytes) * frameBytes
+	return p.bytesForMs(maxMs)
 }
 
 func (p *Player) fadeFrames() int {
@@ -295,10 +319,11 @@ func (p *Player) fadeFrames() int {
 	return f
 }
 
-func (p *Player) startFadeIn() {
+func (p *Player) startFadeIn(fromLast bool) {
 	f := p.fadeFrames()
 	p.pb.fadeInLen = f
 	p.pb.fadeInRem = f
+	p.pb.fadeFromLast = fromLast && p.pb.hasLastOut
 }
 
 // onData is called by miniaudio on its real-time audio thread.
@@ -310,11 +335,35 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 	}
 	frameBytes := p.frameBytes()
 	targetCushion := p.targetPendingBytes()
-	// Desired ring occupancy right before draining len(out).
-	targetBefore := targetCushion + len(out)
+
+	// Account for both the local callback period and observed server packet
+	// granularity, plus 1 frame for the linear interpolator's lookahead.
+	periodBytes := len(out)
+	if obs := int(p.lastWriteBytes.Load()); obs > periodBytes {
+		periodBytes = obs
+	}
+	targetBefore := targetCushion + periodBytes + frameBytes
+
+	// Never let targetBefore exceed ring capacity (prevents permanent silence deadlock).
+	maxSafeTarget := ((p.ring.Cap() * 3 / 4) / frameBytes) * frameBytes
+	if maxSafeTarget < len(out)+frameBytes {
+		maxSafeTarget = ((p.ring.Cap() - frameBytes) / frameBytes) * frameBytes
+	}
+	if maxSafeTarget > 0 && targetBefore > maxSafeTarget {
+		targetBefore = maxSafeTarget
+	}
+
 	maxBytes := p.maxPendingBytes()
-	if maxBytes < targetBefore+len(out) {
-		maxBytes = targetBefore + len(out)
+	headroom := len(out)
+	if h20 := p.bytesForMs(20); h20 > headroom {
+		headroom = h20
+	}
+	if maxBytes < targetBefore+headroom {
+		maxBytes = targetBefore + headroom
+	}
+	maxSafeCap := ((p.ring.Cap() - frameBytes) / frameBytes) * frameBytes
+	if maxSafeCap > 0 && maxBytes > maxSafeCap {
+		maxBytes = maxSafeCap
 	}
 
 	avail := p.ring.Len() + (p.pb.scratchLen - p.pb.scratchOff)
@@ -330,7 +379,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		p.pb.hasCurr = false
 		p.pb.phase = 0
 		p.pb.fillEMA = float64(avail / frameBytes)
-		p.startFadeIn()
+		p.startFadeIn(false)
 	}
 
 	// Hard-trim stale backlog if the buffer exceeded maxBytes (e.g. burst
@@ -359,7 +408,9 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		p.pb.phase = 0
 		avail = p.ring.Len() + (p.pb.scratchLen - p.pb.scratchOff)
 		p.pb.fillEMA = float64(avail / frameBytes)
-		p.startFadeIn()
+		// Crossfade from the previous callback's last sample instead of jumping
+		// down to zero, preventing an audible discontinuity click.
+		p.startFadeIn(true)
 		p.overflowTrims.Add(1)
 	}
 
@@ -443,10 +494,10 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 			}
 		}
 
-		gain := vol
-		if p.pb.fadeInRem > 0 {
-			ramp := float64(p.pb.fadeInLen-p.pb.fadeInRem+1) / float64(p.pb.fadeInLen)
-			gain *= ramp
+		var ramp float64
+		fading := p.pb.fadeInRem > 0
+		if fading {
+			ramp = float64(p.pb.fadeInLen-p.pb.fadeInRem+1) / float64(p.pb.fadeInLen)
 			p.pb.fadeInRem--
 		}
 
@@ -455,7 +506,14 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		for c := 0; c < channels; c++ {
 			s0 := float64(p.pb.prevFrame[c])
 			s1 := float64(p.pb.currFrame[c])
-			sample := (s0 + ph*(s1-s0)) * gain
+			sample := (s0 + ph*(s1-s0)) * vol
+			if fading {
+				if p.pb.fadeFromLast {
+					sample = float64(p.pb.lastOutFrame[c])*(1.0-ramp) + sample*ramp
+				} else {
+					sample *= ramp
+				}
+			}
 			var clamped int16
 			if sample >= 32767.0 {
 				clamped = 32767
@@ -470,12 +528,21 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 		p.pb.phase += ratio
 		writtenFrames++
 	}
+
+	if writtenFrames > 0 {
+		lastBase := (writtenFrames - 1) * frameBytes
+		for c := 0; c < channels; c++ {
+			p.pb.lastOutFrame[c] = int16(binary.LittleEndian.Uint16(out[lastBase+c*2 : lastBase+c*2+2]))
+		}
+		p.pb.hasLastOut = true
+	}
 }
 
 func (p *Player) enterUnderrun() {
 	p.underruns.Add(1)
 	p.pb.playing = false
 	p.pb.hasCurr = false
+	p.pb.hasLastOut = false
 	p.pb.phase = 0
 	p.pb.scratchOff = 0
 	p.pb.scratchLen = 0
@@ -489,9 +556,12 @@ func (p *Player) refillScratch(wantBytes, frameBytes int) {
 		return
 	}
 	if len(p.pb.scratch) < wantBytes {
-		p.pb.scratch = make([]byte, wantBytes)
-	}
-	if rem > 0 && p.pb.scratchOff > 0 {
+		newBuf := make([]byte, wantBytes)
+		if rem > 0 {
+			copy(newBuf, p.pb.scratch[p.pb.scratchOff:p.pb.scratchLen])
+		}
+		p.pb.scratch = newBuf
+	} else if rem > 0 && p.pb.scratchOff > 0 {
 		copy(p.pb.scratch, p.pb.scratch[p.pb.scratchOff:p.pb.scratchLen])
 	}
 	p.pb.scratchOff = 0
@@ -558,7 +628,8 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 		p.mu.Unlock()
 		return
 	}
-	p.started = false
+	// Keep p.started true while swapping so a transient reopen error (e.g.
+	// Bluetooth/USB switch in progress) can still recover on the next event.
 	old := p.device
 	p.device = nil
 	p.devID = info.ID
@@ -588,8 +659,14 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 	}
 
 	p.mu.Lock()
+	if !p.started {
+		// Stop() was called concurrently; clean up the newly created device.
+		p.mu.Unlock()
+		_ = dev.Stop()
+		dev.Uninit()
+		return
+	}
 	p.device = dev
-	p.started = true
 	p.mu.Unlock()
 }
 
