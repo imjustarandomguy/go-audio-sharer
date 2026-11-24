@@ -128,7 +128,7 @@ func NewPlayer(cfg Config) (*Player, error) {
 	}
 	p.volumeBits.Store(math.Float64bits(1.0))
 	p.pb.scratch = make([]byte, 16*1024)
-	p.monitor = newDeviceMonitor(ctx.Context, cfg.Device, func(info *malgo.DeviceInfo) {
+	p.monitor = newDeviceMonitor(cfg.Device, func(info *malgo.DeviceInfo) {
 		p.followDefault(info)
 	})
 	return p, nil

@@ -9,6 +9,11 @@ import (
 	"github.com/gen2brain/malgo"
 )
 
+const (
+	devicePollInterval = 5 * time.Second
+	deviceDebounce     = 250 * time.Millisecond
+)
+
 // newAudioContext creates the process audio context (miniaudio).
 func newAudioContext() (*malgo.AllocatedContext, error) {
 	return newAudioContextWith(nil)
@@ -67,46 +72,59 @@ var (
 	discoveryCtx *malgo.AllocatedContext
 )
 
-func getDiscoveryContext() (*malgo.AllocatedContext, error) {
+// withDiscoveryContext runs fn against a shared, isolated discovery audio
+// context serialized by discoveryMu. Isolating enumeration from the live
+// streaming malgo.Context prevents OS driver / PulseAudio mainloop locks from
+// stalling active audio callbacks.
+func withDiscoveryContext(fn func(malgo.Context) error) error {
 	discoveryMu.Lock()
 	defer discoveryMu.Unlock()
-	if discoveryCtx != nil {
-		return discoveryCtx, nil
+
+	if discoveryCtx == nil {
+		c, err := newAudioContext()
+		if err != nil {
+			return err
+		}
+		discoveryCtx = c
 	}
-	c, err := newAudioContext()
-	if err != nil {
-		return nil, err
+
+	if err := fn(discoveryCtx.Context); err != nil {
+		// If querying failed (e.g. audio server restarted), invalidate and retry once.
+		_ = discoveryCtx.Uninit()
+		discoveryCtx.Free()
+		discoveryCtx = nil
+
+		c, err2 := newAudioContext()
+		if err2 != nil {
+			return err2
+		}
+		discoveryCtx = c
+		return fn(discoveryCtx.Context)
 	}
-	discoveryCtx = c
-	return discoveryCtx, nil
+	return nil
 }
 
 // ListPlaybackDeviceDescriptions returns the playback devices for display.
 // It reuses a shared discovery audio context to avoid re-initializing the OS
 // audio driver on every poll.
 func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
-	c, err := getDiscoveryContext()
-	if err != nil {
-		return nil, err
-	}
-	desc, err := ListPlaybackDeviceDescriptionsWith(c.Context)
-	if err != nil {
-		// If querying failed (e.g. audio server restarted), invalidate and retry once.
-		discoveryMu.Lock()
-		if discoveryCtx == c {
-			_ = discoveryCtx.Uninit()
-			discoveryCtx.Free()
-			discoveryCtx = nil
-		}
-		discoveryMu.Unlock()
+	var desc []DeviceDesc
+	err := withDiscoveryContext(func(ctx malgo.Context) error {
+		var err error
+		desc, err = ListPlaybackDeviceDescriptionsWith(ctx)
+		return err
+	})
+	return desc, err
+}
 
-		c2, err2 := getDiscoveryContext()
-		if err2 != nil {
-			return nil, err2
-		}
-		return ListPlaybackDeviceDescriptionsWith(c2.Context)
-	}
-	return desc, nil
+func defaultPlaybackDeviceFromDiscovery() (*malgo.DeviceInfo, error) {
+	var info *malgo.DeviceInfo
+	err := withDiscoveryContext(func(ctx malgo.Context) error {
+		var err error
+		info, err = playbackDevice(ctx, "")
+		return err
+	})
+	return info, err
 }
 
 // ListPlaybackDeviceDescriptionsWith returns playback devices from an existing context.
@@ -155,8 +173,14 @@ func loopbackCaptureDevice(ctx malgo.Context, filter string) (*malgo.DeviceInfo,
 // DeviceMonitor watches for the default playback device changing so the audio
 // device can be re-created to follow it. Only meaningful when no specific
 // device filter was chosen.
+//
+// Device enumeration runs against the isolated discovery context rather than
+// the live streaming context so polling never contends with real-time audio.
 type DeviceMonitor struct {
-	ctx      malgo.Context
+	pollFn   func() (*malgo.DeviceInfo, error)
+	interval time.Duration
+	debounce time.Duration
+
 	filter   string
 	mu       sync.Mutex
 	current  string
@@ -166,9 +190,20 @@ type DeviceMonitor struct {
 	once     sync.Once
 }
 
-func newDeviceMonitor(ctx malgo.Context, filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
+func newDeviceMonitor(filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
+	return newDeviceMonitorWith(defaultPlaybackDeviceFromDiscovery, devicePollInterval, deviceDebounce, filter, onChange)
+}
+
+func newDeviceMonitorWith(
+	pollFn func() (*malgo.DeviceInfo, error),
+	interval, debounce time.Duration,
+	filter string,
+	onChange func(*malgo.DeviceInfo),
+) *DeviceMonitor {
 	dm := &DeviceMonitor{
-		ctx:      ctx,
+		pollFn:   pollFn,
+		interval: interval,
+		debounce: debounce,
 		filter:   filter,
 		onChange: onChange,
 		stopCh:   make(chan struct{}),
@@ -180,35 +215,78 @@ func newDeviceMonitor(ctx malgo.Context, filter string, onChange func(*malgo.Dev
 
 func (dm *DeviceMonitor) run() {
 	defer close(dm.done)
-	t := time.NewTicker(time.Second)
+	t := time.NewTicker(dm.interval)
 	defer t.Stop()
 	for {
 		select {
 		case <-dm.stopCh:
 			return
 		case <-t.C:
-			dm.mu.Lock()
-			filter := dm.filter
-			dm.mu.Unlock()
-			if filter != "" {
-				continue
-			}
-			info, err := playbackDevice(dm.ctx, "")
-			if err != nil {
-				continue
-			}
-			id := info.ID.String()
-			dm.mu.Lock()
-			// Re-check filter under lock in case setFilter was called concurrently.
-			changed := dm.filter == "" && dm.current != "" && id != dm.current
-			if dm.filter == "" {
-				dm.current = id
-			}
-			dm.mu.Unlock()
-			if changed && dm.onChange != nil {
-				dm.onChange(info)
-			}
+			dm.pollOnce()
 		}
+	}
+}
+
+func (dm *DeviceMonitor) pollOnce() {
+	dm.mu.Lock()
+	filter := dm.filter
+	dm.mu.Unlock()
+	if filter != "" || dm.pollFn == nil {
+		return
+	}
+
+	info, err := dm.pollFn()
+	if err != nil || info == nil {
+		return
+	}
+	id := info.ID.String()
+
+	dm.mu.Lock()
+	if dm.filter != "" {
+		dm.mu.Unlock()
+		return
+	}
+	if dm.current == "" {
+		dm.current = id
+		dm.mu.Unlock()
+		return
+	}
+	if id == dm.current {
+		dm.mu.Unlock()
+		return
+	}
+	dm.mu.Unlock()
+
+	// Confirm the change after a short debounce so transient OS/driver
+	// enumeration hiccups don't reset an active audio stream.
+	if dm.debounce > 0 {
+		timer := time.NewTimer(dm.debounce)
+		select {
+		case <-dm.stopCh:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		info2, err := dm.pollFn()
+		if err != nil || info2 == nil {
+			return
+		}
+		id2 := info2.ID.String()
+		if id2 != id {
+			return
+		}
+		info = info2
+	}
+
+	dm.mu.Lock()
+	changed := dm.filter == "" && dm.current != "" && id != dm.current
+	if dm.filter == "" {
+		dm.current = id
+	}
+	dm.mu.Unlock()
+
+	if changed && dm.onChange != nil {
+		dm.onChange(info)
 	}
 }
 

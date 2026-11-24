@@ -56,7 +56,7 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 		config: cfg,
 	}
 	r.broadcaster = NewBroadcaster(r.startRecording, r.stopRecording)
-	r.monitor = newDeviceMonitor(c.Context, cfg.Device, func(info *malgo.DeviceInfo) {
+	r.monitor = newDeviceMonitor(cfg.Device, func(info *malgo.DeviceInfo) {
 		r.handleDeviceChange(info)
 	})
 	return r, nil
