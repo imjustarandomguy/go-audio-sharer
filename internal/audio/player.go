@@ -11,6 +11,49 @@ import (
 	"github.com/gen2brain/malgo"
 )
 
+const (
+	maxResampleChannels = 8
+
+	// Adaptive clock-drift PI controller constants.
+	// Smoothed over ~0.5s so short network jitter doesn't cause pitch wobble,
+	// while hardware crystal drift (typically +/-20..100 ppm) is tracked to zero
+	// steady-state error well within the inaudible +/-0.5% cap.
+	driftEMAAlpha    = 0.02
+	driftKp          = 0.25
+	driftKi          = 0.02
+	driftMaxIntegral = 0.002 // +/-2000 ppm
+	driftMaxRatio    = 0.005 // +/-0.5% (< 9 cents, inaudible)
+)
+
+// playbackState holds consumer-only state accessed exclusively from the
+// miniaudio real-time audio callback (or after device.Stop()).
+type playbackState struct {
+	playing    bool
+	hasCurr    bool
+	prevFrame  [maxResampleChannels]int16
+	currFrame  [maxResampleChannels]int16
+	phase      float64
+	fillEMA    float64
+	integral   float64
+	fadeInRem  int
+	fadeInLen  int
+	scratch    []byte
+	scratchOff int
+	scratchLen int
+}
+
+func (s *playbackState) reset() {
+	s.playing = false
+	s.hasCurr = false
+	s.phase = 0
+	s.fillEMA = 0
+	s.integral = 0
+	s.fadeInRem = 0
+	s.fadeInLen = 0
+	s.scratchOff = 0
+	s.scratchLen = 0
+}
+
 // Player streams raw PCM to an audio output device via miniaudio (malgo).
 // It supports selecting a specific output device and automatically follows the
 // system default output device when none is explicitly selected.
@@ -27,6 +70,9 @@ type Player struct {
 	config     Config
 	devID      malgo.DeviceID
 	devName    string
+
+	// Consumer-only state (only touched in onData or after device.Stop()).
+	pb playbackState
 }
 
 func NewPlayer(cfg Config) (*Player, error) {
@@ -40,6 +86,7 @@ func NewPlayer(cfg Config) (*Player, error) {
 		ring:   newByteRingBuffer(512 * 1024), // 512 KB (~2.7s headroom at 48kHz stereo)
 	}
 	p.volumeBits.Store(math.Float64bits(1.0))
+	p.pb.scratch = make([]byte, 16*1024)
 	p.monitor = newDeviceMonitor(ctx.Context, cfg.Device, func(info *malgo.DeviceInfo) {
 		p.followDefault(info)
 	})
@@ -73,11 +120,22 @@ func (p *Player) createDevice() (*malgo.Device, error) {
 		p.monitor.setCurrent(info.ID.String())
 	}
 
+	// Keep the hardware callback period crisp (5-10 ms) even when the user
+	// selects a larger jitter buffer target (e.g. 30-100 ms), so the extra
+	// latency goes into the jitter buffer rather than sluggish hardware periods.
+	periodMs := p.config.BufferMs
+	if periodMs <= 0 {
+		periodMs = 10
+	}
+	if periodMs > 10 {
+		periodMs = 10
+	}
+
 	dc := malgo.DefaultDeviceConfig(malgo.Playback)
 	dc.Playback.Format = malgo.FormatS16
 	dc.Playback.Channels = uint32(p.config.Channels)
 	dc.SampleRate = uint32(p.config.SampleRate)
-	dc.PeriodSizeInMilliseconds = uint32(p.config.BufferMs)
+	dc.PeriodSizeInMilliseconds = uint32(periodMs)
 	dc.Alsa.NoMMap = 1
 
 	// Pin to a specific device only when one was explicitly requested; otherwise
@@ -103,6 +161,8 @@ func (p *Player) Start() error {
 		return nil
 	}
 	p.mu.Unlock()
+
+	p.pb.reset()
 
 	dev, err := p.createDevice()
 	if err != nil {
@@ -133,48 +193,306 @@ func (p *Player) Write(data []byte) error {
 	return nil
 }
 
-// maxPendingBytes is the target upper bound for buffered PCM, in bytes. It
-// keeps buffered latency at least one device period but never more than a small
-// constant, discarding overflow beyond that.
+// targetPendingBytes returns the desired jitter-buffer cushion (in bytes)
+// maintained after each audio callback drains a period.
+func (p *Player) targetPendingBytes() int {
+	frameBytes := p.frameBytes()
+	bytesPerSec := p.config.SampleRate * frameBytes
+	if bytesPerSec <= 0 {
+		return 0
+	}
+	ms := p.config.BufferMs
+	if ms <= 0 {
+		ms = 10
+	}
+	raw := (bytesPerSec * ms) / 1000
+	return (raw / frameBytes) * frameBytes
+}
+
+// maxPendingBytes is the upper bound for buffered PCM before hard trimming.
+// It provides generous headroom above the target cushion so normal jitter or
+// PipeWire quantum fluctuations don't trigger drops, while still capping
+// runaway latency after a network stall.
 func (p *Player) maxPendingBytes() int {
 	frameBytes := p.frameBytes()
 	bytesPerSec := p.config.SampleRate * frameBytes
 	if bytesPerSec <= 0 {
 		return 1 << 16
 	}
-	ms := p.config.BufferMs
-	if ms < 50 {
-		ms = 50
+	targetMs := p.config.BufferMs
+	if targetMs <= 0 {
+		targetMs = 10
 	}
-	raw := (bytesPerSec * ms) / 1000
+	maxMs := targetMs * 3
+	if maxMs < targetMs+40 {
+		maxMs = targetMs + 40
+	}
+	if maxMs < 50 {
+		maxMs = 50
+	}
+	raw := (bytesPerSec * maxMs) / 1000
 	return (raw / frameBytes) * frameBytes
 }
 
+func (p *Player) fadeFrames() int {
+	if p.config.SampleRate <= 0 {
+		return 1
+	}
+	f := p.config.SampleRate / 500 // 2 ms
+	if f < 1 {
+		return 1
+	}
+	return f
+}
+
+func (p *Player) startFadeIn() {
+	f := p.fadeFrames()
+	p.pb.fadeInLen = f
+	p.pb.fadeInRem = f
+}
+
 // onData is called by miniaudio on its real-time audio thread.
-// It must remain lock-free to avoid priority inversion against the network goroutine.
+// It must remain lock-free and allocation-free to avoid priority inversion
+// and GC stalls against the network goroutine.
 func (p *Player) onData(out, _ []byte, framecount uint32) {
+	if len(out) == 0 {
+		return
+	}
 	frameBytes := p.frameBytes()
-	max := p.maxPendingBytes()
-	avail := p.ring.Len()
-	if avail > max {
-		drop := avail - max
-		// Align drop up to the next frame boundary so frame alignment is strictly
-		// maintained (preventing left/right channel flips or byte-shift distortion).
+	targetCushion := p.targetPendingBytes()
+	// Desired ring occupancy right before draining len(out).
+	targetBefore := targetCushion + len(out)
+	maxBytes := p.maxPendingBytes()
+	if maxBytes < targetBefore+len(out) {
+		maxBytes = targetBefore + len(out)
+	}
+
+	avail := p.ring.Len() + (p.pb.scratchLen - p.pb.scratchOff)
+
+	// Pre-buffer until we have our target jitter cushion before starting
+	// (or resuming after an underrun).
+	if !p.pb.playing {
+		if avail < targetBefore {
+			clear(out)
+			return
+		}
+		p.pb.playing = true
+		p.pb.hasCurr = false
+		p.pb.phase = 0
+		p.pb.fillEMA = float64(avail / frameBytes)
+		p.startFadeIn()
+	}
+
+	// Hard-trim stale backlog if the buffer exceeded maxBytes (e.g. burst
+	// arriving after a stall), snapping cleanly back to targetBefore.
+	if avail > maxBytes {
+		drop := avail - targetBefore
 		if rem := drop % frameBytes; rem != 0 {
 			drop += frameBytes - rem
 		}
-		p.ring.Discard(drop)
+		// Discard any buffered lookahead in scratch first, then from the ring.
+		scratchAvail := p.pb.scratchLen - p.pb.scratchOff
+		if scratchAvail > 0 {
+			if drop >= scratchAvail {
+				drop -= scratchAvail
+				p.pb.scratchOff = 0
+				p.pb.scratchLen = 0
+			} else {
+				p.pb.scratchOff += drop
+				drop = 0
+			}
+		}
+		if drop > 0 {
+			p.ring.Discard(drop)
+		}
+		p.pb.hasCurr = false
+		p.pb.phase = 0
+		avail = p.ring.Len() + (p.pb.scratchLen - p.pb.scratchOff)
+		p.pb.fillEMA = float64(avail / frameBytes)
+		p.startFadeIn()
 	}
-
-	n := p.ring.Read(out)
 
 	vol := math.Float64frombits(p.volumeBits.Load())
-	if vol != 1.0 {
-		scaleS16(out[:n], vol)
+	channels := p.config.Channels
+	if p.config.BitsPerSample != 16 || channels <= 0 || channels > maxResampleChannels || p.config.SampleRate <= 0 {
+		n := p.ring.Read(out)
+		if vol != 1.0 {
+			scaleS16(out[:n], vol)
+		}
+		clear(out[n:])
+		if n < len(out) {
+			p.pb.playing = false
+		}
+		return
 	}
-	// zero any remaining space (underflow -> silence)
-	for i := n; i < len(out); i++ {
-		out[i] = 0
+
+	outFrames := len(out) / frameBytes
+	if outFrames == 0 {
+		clear(out)
+		return
+	}
+
+	// Update smoothed buffer depth and compute adaptive resampling ratio.
+	availFrames := float64(avail / frameBytes)
+	p.pb.fillEMA += driftEMAAlpha * (availFrames - p.pb.fillEMA)
+	targetFrames := float64(targetBefore / frameBytes)
+	errSec := (p.pb.fillEMA - targetFrames) / float64(p.config.SampleRate)
+	dt := float64(outFrames) / float64(p.config.SampleRate)
+
+	p.pb.integral += driftKi * errSec * dt
+	if p.pb.integral > driftMaxIntegral {
+		p.pb.integral = driftMaxIntegral
+	} else if p.pb.integral < -driftMaxIntegral {
+		p.pb.integral = -driftMaxIntegral
+	}
+
+	adj := driftKp*errSec + p.pb.integral
+	if adj > driftMaxRatio {
+		adj = driftMaxRatio
+	} else if adj < -driftMaxRatio {
+		adj = -driftMaxRatio
+	}
+	ratio := 1.0 + adj
+
+	// Prefetch all frames needed for this callback in a single ring Read.
+	needFrames := int(math.Floor(p.pb.phase + float64(outFrames-1)*ratio))
+	if needFrames < 0 {
+		needFrames = 0
+	}
+	if !p.pb.hasCurr {
+		needFrames += 2
+	}
+	// Request 1 extra frame as FP rounding margin only if available.
+	p.refillScratch((needFrames+1)*frameBytes, frameBytes)
+
+	if !p.pb.hasCurr {
+		if !p.nextFrame(&p.pb.prevFrame, channels, frameBytes) || !p.nextFrame(&p.pb.currFrame, channels, frameBytes) {
+			clear(out)
+			p.enterUnderrun()
+			return
+		}
+		p.pb.hasCurr = true
+		p.pb.phase = 0
+	}
+
+	writtenFrames := 0
+	for i := 0; i < outFrames; i++ {
+		for p.pb.phase >= 1.0 {
+			p.pb.phase -= 1.0
+			p.pb.prevFrame = p.pb.currFrame
+			if !p.nextFrame(&p.pb.currFrame, channels, frameBytes) {
+				// Underrun partway through the callback: fade out written tail
+				// to avoid a click, zero the rest, and re-buffer cleanly.
+				if writtenFrames > 0 {
+					fadeOutTailS16(out[:writtenFrames*frameBytes], channels, p.fadeFrames())
+				}
+				clear(out[writtenFrames*frameBytes:])
+				p.enterUnderrun()
+				return
+			}
+		}
+
+		gain := vol
+		if p.pb.fadeInRem > 0 {
+			ramp := float64(p.pb.fadeInLen-p.pb.fadeInRem+1) / float64(p.pb.fadeInLen)
+			gain *= ramp
+			p.pb.fadeInRem--
+		}
+
+		base := i * frameBytes
+		ph := p.pb.phase
+		for c := 0; c < channels; c++ {
+			s0 := float64(p.pb.prevFrame[c])
+			s1 := float64(p.pb.currFrame[c])
+			sample := (s0 + ph*(s1-s0)) * gain
+			var clamped int16
+			if sample >= 32767.0 {
+				clamped = 32767
+			} else if sample <= -32768.0 {
+				clamped = -32768
+			} else {
+				clamped = int16(math.Round(sample))
+			}
+			binary.LittleEndian.PutUint16(out[base+c*2:base+c*2+2], uint16(clamped))
+		}
+
+		p.pb.phase += ratio
+		writtenFrames++
+	}
+}
+
+func (p *Player) enterUnderrun() {
+	p.pb.playing = false
+	p.pb.hasCurr = false
+	p.pb.phase = 0
+	p.pb.scratchOff = 0
+	p.pb.scratchLen = 0
+}
+
+// refillScratch ensures p.pb.scratch holds up to wantBytes (aligned to frameBytes)
+// from the ring buffer using at most one ring.Read call.
+func (p *Player) refillScratch(wantBytes, frameBytes int) {
+	rem := p.pb.scratchLen - p.pb.scratchOff
+	if rem >= wantBytes {
+		return
+	}
+	if len(p.pb.scratch) < wantBytes {
+		p.pb.scratch = make([]byte, wantBytes)
+	}
+	if rem > 0 && p.pb.scratchOff > 0 {
+		copy(p.pb.scratch, p.pb.scratch[p.pb.scratchOff:p.pb.scratchLen])
+	}
+	p.pb.scratchOff = 0
+	p.pb.scratchLen = rem
+
+	toRead := wantBytes - rem
+	toRead = (toRead / frameBytes) * frameBytes
+	if toRead <= 0 {
+		return
+	}
+	n := p.ring.Read(p.pb.scratch[rem : rem+toRead])
+	p.pb.scratchLen = rem + n
+}
+
+func (p *Player) nextFrame(dst *[maxResampleChannels]int16, channels, frameBytes int) bool {
+	if p.pb.scratchLen-p.pb.scratchOff < frameBytes {
+		p.refillScratch(frameBytes, frameBytes)
+		if p.pb.scratchLen-p.pb.scratchOff < frameBytes {
+			return false
+		}
+	}
+	off := p.pb.scratchOff
+	for c := 0; c < channels; c++ {
+		dst[c] = int16(binary.LittleEndian.Uint16(p.pb.scratch[off+c*2 : off+c*2+2]))
+	}
+	p.pb.scratchOff += frameBytes
+	return true
+}
+
+// fadeOutTailS16 applies a linear fade-out to the final frames of b to prevent
+// an audible click when transitioning into silence on an underrun.
+func fadeOutTailS16(b []byte, channels, fadeFrames int) {
+	frameBytes := channels * 2
+	if frameBytes <= 0 || fadeFrames <= 0 {
+		return
+	}
+	totalFrames := len(b) / frameBytes
+	if totalFrames == 0 {
+		return
+	}
+	n := fadeFrames
+	if n > totalFrames {
+		n = totalFrames
+	}
+	startFrame := totalFrames - n
+	for i := 0; i < n; i++ {
+		gain := float64(n-1-i) / float64(n)
+		base := (startFrame + i) * frameBytes
+		for c := 0; c < channels; c++ {
+			s := int16(binary.LittleEndian.Uint16(b[base+c*2 : base+c*2+2]))
+			v := int16(math.Round(float64(s) * gain))
+			binary.LittleEndian.PutUint16(b[base+c*2:base+c*2+2], uint16(v))
+		}
 	}
 }
 
@@ -195,12 +513,14 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) {
 	p.devName = info.Name()
 	p.mu.Unlock()
 
-	// Stop old device before resetting the SPSC ring buffer so onData is no longer running.
+	// Stop old device before resetting the SPSC ring buffer and consumer state
+	// so onData is no longer running.
 	if old != nil {
 		_ = old.Stop()
 		old.Uninit()
 	}
 	p.ring.Reset()
+	p.pb.reset()
 
 	dev, err := p.createDevice()
 	if err != nil {
@@ -233,12 +553,14 @@ func (p *Player) Stop() {
 	p.device = nil
 	p.mu.Unlock()
 
-	// Stop device before resetting the SPSC ring buffer so onData is no longer running.
+	// Stop device before resetting the SPSC ring buffer and consumer state
+	// so onData is no longer running.
 	if dev != nil {
 		_ = dev.Stop()
 		dev.Uninit()
 	}
 	p.ring.Reset()
+	p.pb.reset()
 }
 
 // LatencyMs returns the approximate current playback latency in milliseconds,
