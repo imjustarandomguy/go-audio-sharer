@@ -34,6 +34,7 @@ type Recorder struct {
 	mu          sync.Mutex
 	isRecording bool
 	captureID   malgo.DeviceID
+	bufPool     sync.Pool
 
 	lastCaptureNs   atomic.Int64
 	maxCaptureGapNs atomic.Int64
@@ -201,6 +202,26 @@ func (r *Recorder) TakeStats() RecorderStats {
 	}
 }
 
+func (r *Recorder) allocBlock(in []byte) CapturedBlock {
+	var pb *pooledBuf
+	if v := r.bufPool.Get(); v != nil {
+		pb = v.(*pooledBuf)
+	} else {
+		pb = &pooledBuf{pool: &r.bufPool}
+	}
+	if cap(pb.data) < len(in) {
+		pb.data = make([]byte, len(in))
+	} else {
+		pb.data = pb.data[:len(in)]
+	}
+	copy(pb.data, in)
+	pb.refs.Store(1)
+	return CapturedBlock{
+		Data: pb.data,
+		buf:  pb,
+	}
+}
+
 func (r *Recorder) onData(_, in []byte, framecount uint32) {
 	if len(in) == 0 {
 		return
@@ -209,12 +230,7 @@ func (r *Recorder) onData(_, in []byte, framecount uint32) {
 	if prev := r.lastCaptureNs.Swap(now); prev > 0 && now > prev {
 		recordMaxInt64(&r.maxCaptureGapNs, now-prev)
 	}
-	block := make([]byte, len(in))
-	copy(block, in)
-	r.broadcaster.Broadcast(CapturedBlock{
-		Data: block,
-		Time: time.Now().UTC(),
-	})
+	r.broadcaster.Broadcast(r.allocBlock(in))
 }
 
 func (r *Recorder) stopRecording() {

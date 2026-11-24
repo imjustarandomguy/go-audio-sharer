@@ -133,11 +133,12 @@ func (s *streamServer) GetStream(_ *emptypb.Empty, stream pb.AudioStream_GetStre
 	ch := s.recorder.Subscribe()
 	defer s.recorder.Unsubscribe(ch)
 
+	sample := &pb.AudioSample{}
 	for block := range ch {
-		err := stream.Send(&pb.AudioSample{
-			Timestamp: block.Time.Format(time.RFC3339Nano),
-			Data:      block.Data,
-		})
+		sample.Data = block.Data
+		err := stream.Send(sample)
+		sample.Data = nil
+		block.Release()
 		if err != nil {
 			log.Printf("Error sending stream to %s: %v", addr, err)
 			return err
@@ -193,7 +194,9 @@ func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, conf
 
 		for block := range ch {
 			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := conn.WriteMessage(websocket.BinaryMessage, block.Data); err != nil {
+			err := conn.WriteMessage(websocket.BinaryMessage, block.Data)
+			block.Release()
+			if err != nil {
 				log.Printf("WebSocket write error: %v", err)
 				return
 			}

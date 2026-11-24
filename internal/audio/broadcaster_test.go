@@ -45,14 +45,14 @@ func TestBroadcasterLifecycle(t *testing.T) {
 
 	// Broadcast sends to both
 	testData := []byte("audio-sample")
-	now := time.Now()
-	b.Broadcast(CapturedBlock{Data: testData, Time: now})
+	b.Broadcast(CapturedBlock{Data: testData})
 
 	select {
 	case block := <-ch1:
 		if string(block.Data) != string(testData) {
 			t.Fatalf("ch1 got %s, want %s", block.Data, testData)
 		}
+		block.Release()
 	case <-time.After(time.Second):
 		t.Fatal("ch1 timed out")
 	}
@@ -62,6 +62,7 @@ func TestBroadcasterLifecycle(t *testing.T) {
 		if string(block.Data) != string(testData) {
 			t.Fatalf("ch2 got %s, want %s", block.Data, testData)
 		}
+		block.Release()
 	case <-time.After(time.Second):
 		t.Fatal("ch2 timed out")
 	}
@@ -83,27 +84,68 @@ func TestBroadcasterLifecycle(t *testing.T) {
 	}
 }
 
-func TestBroadcasterNonBlockingDrop(t *testing.T) {
+func TestBroadcasterDropOldestOnFull(t *testing.T) {
 	b := NewBroadcaster(nil, nil)
 	ch := b.SubscribeWithChan()
 	defer b.UnsubscribeWithChan(ch)
 
-	// Capacity of ch is 100. Fill it up to 100 blocks.
-	for i := 0; i < 100; i++ {
+	total := subscriberQueueSize + 5
+	for i := 0; i < total; i++ {
 		b.Broadcast(CapturedBlock{Data: []byte{byte(i)}})
 	}
 
-	// 101st broadcast should not block and should simply drop
-	done := make(chan struct{})
-	go func() {
-		b.Broadcast(CapturedBlock{Data: []byte("overflow")})
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// success: did not block
-	case <-time.After(time.Second):
-		t.Fatal("Broadcast blocked on full channel")
+	if dropped := b.TakeDropped(); dropped != 5 {
+		t.Fatalf("dropped = %d, want 5", dropped)
 	}
+
+	// Subscriber should receive the newest subscriberQueueSize blocks (5..total-1).
+	for want := 5; want < total; want++ {
+		select {
+		case blk := <-ch:
+			if len(blk.Data) != 1 || blk.Data[0] != byte(want) {
+				t.Fatalf("got block %v, want [%d]", blk.Data, want)
+			}
+			blk.Release()
+		default:
+			t.Fatalf("expected queued block %d, channel was empty", want)
+		}
+	}
+}
+
+func TestBroadcasterPooledBlocksConcurrent(t *testing.T) {
+	r := &Recorder{
+		broadcaster: NewBroadcaster(nil, nil),
+	}
+
+	ch1 := r.broadcaster.SubscribeWithChan()
+	ch2 := r.broadcaster.SubscribeWithChan()
+
+	const count = 200
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	consume := func(ch chan CapturedBlock) {
+		defer wg.Done()
+		for blk := range ch {
+			// Touch payload to let -race detect any premature buffer reuse.
+			if len(blk.Data) != 1920 || blk.Data[0] != blk.Data[1919] {
+				t.Errorf("corrupted pooled block: len=%d first=%d last=%d", len(blk.Data), blk.Data[0], blk.Data[len(blk.Data)-1])
+			}
+			blk.Release()
+		}
+	}
+	go consume(ch1)
+	go consume(ch2)
+
+	raw := make([]byte, 1920)
+	for i := 0; i < count; i++ {
+		v := byte(i)
+		raw[0] = v
+		raw[1919] = v
+		r.broadcaster.Broadcast(r.allocBlock(raw))
+	}
+
+	r.broadcaster.UnsubscribeWithChan(ch1)
+	r.broadcaster.UnsubscribeWithChan(ch2)
+	wg.Wait()
 }
