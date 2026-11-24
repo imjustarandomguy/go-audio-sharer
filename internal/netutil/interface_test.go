@@ -42,17 +42,27 @@ func TestDialTargetInvalid(t *testing.T) {
 	}
 }
 
-func TestNewDialer(t *testing.T) {
-	ip := net.ParseIP("10.0.0.5")
-	d := NewDialer(ip)
-	if d.LocalAddr == nil {
-		t.Fatal("NewDialer with ip should set LocalAddr")
+func TestDialUDP(t *testing.T) {
+	srv, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("ListenUDP: %v", err)
+	}
+	defer srv.Close()
+
+	c1, err := DialUDP(net.IPv4(127, 0, 0, 1), srv.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("DialUDP with localIP: %v", err)
+	}
+	defer c1.Close()
+	if la, ok := c1.LocalAddr().(*net.UDPAddr); !ok || !la.IP.Equal(net.IPv4(127, 0, 0, 1)) {
+		t.Fatalf("LocalAddr = %v, want 127.0.0.1", c1.LocalAddr())
 	}
 
-	d2 := NewDialer(nil)
-	if d2.LocalAddr != nil {
-		t.Error("NewDialer without ip should leave LocalAddr nil")
+	c2, err := DialUDP(nil, srv.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("DialUDP without localIP: %v", err)
 	}
+	defer c2.Close()
 }
 
 func TestFindInterface(t *testing.T) {

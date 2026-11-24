@@ -17,7 +17,8 @@ const (
 )
 
 var (
-	errNoPlaybackDevice = errors.New("no playback device available")
+	errNoPlaybackDevice   = errors.New("no playback device available")
+	errAudioContextClosed = errors.New("audio context closed")
 
 	// recorderBackends matches Recorder's preferred backend order on Linux
 	// (PulseAudio first for monitor loopback support, avoiding the null backend).
@@ -54,13 +55,15 @@ type ctxReq struct {
 // (CoInitializeEx), device control, and teardown (CoUninitialize) always run on
 // the same OS thread, regardless of which Go goroutine calls Start/Stop/Close.
 type lockedAudioContext struct {
-	reqCh chan ctxReq
-	done  chan struct{}
-	once  sync.Once
+	reqCh  chan ctxReq
+	stopCh chan struct{}
+	done   chan struct{}
+	once   sync.Once
 }
 
 func newLockedAudioContext(backends []malgo.Backend) (*lockedAudioContext, error) {
 	reqCh := make(chan ctxReq)
+	stopCh := make(chan struct{})
 	done := make(chan struct{})
 	initErr := make(chan error, 1)
 
@@ -74,13 +77,19 @@ func newLockedAudioContext(backends []malgo.Backend) (*lockedAudioContext, error
 			return
 		}
 		initErr <- nil
+		defer func() {
+			_ = c.Uninit()
+			c.Free()
+		}()
 
-		for req := range reqCh {
-			req.resp <- req.fn(c.Context)
+		for {
+			select {
+			case <-stopCh:
+				return
+			case req := <-reqCh:
+				req.resp <- req.fn(c.Context)
+			}
 		}
-
-		_ = c.Uninit()
-		c.Free()
 	}()
 
 	if err := <-initErr; err != nil {
@@ -88,20 +97,30 @@ func newLockedAudioContext(backends []malgo.Backend) (*lockedAudioContext, error
 		return nil, err
 	}
 	return &lockedAudioContext{
-		reqCh: reqCh,
-		done:  done,
+		reqCh:  reqCh,
+		stopCh: stopCh,
+		done:   done,
 	}, nil
 }
 
 func (l *lockedAudioContext) do(fn func(malgo.Context) error) error {
 	resp := make(chan error, 1)
-	l.reqCh <- ctxReq{fn: fn, resp: resp}
-	return <-resp
+	select {
+	case <-l.stopCh:
+		return errAudioContextClosed
+	case l.reqCh <- ctxReq{fn: fn, resp: resp}:
+	}
+	select {
+	case err := <-resp:
+		return err
+	case <-l.done:
+		return errAudioContextClosed
+	}
 }
 
 func (l *lockedAudioContext) close() {
 	l.once.Do(func() {
-		close(l.reqCh)
+		close(l.stopCh)
 		<-l.done
 	})
 }

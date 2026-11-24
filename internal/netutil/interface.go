@@ -127,3 +127,23 @@ func NewDialer(localIP net.IP) *net.Dialer {
 	}
 	return d
 }
+
+// DialUDP opens a connected UDP socket to target, optionally bound to localIP
+// so traffic routes over the selected LAN interface (bypassing VPN tunnels).
+func DialUDP(localIP net.IP, target string) (*net.UDPConn, error) {
+	network := "udp"
+	var laddr *net.UDPAddr
+	if localIP != nil {
+		if ip4 := localIP.To4(); ip4 != nil {
+			network = "udp4"
+			laddr = &net.UDPAddr{IP: ip4}
+		} else {
+			laddr = &net.UDPAddr{IP: localIP}
+		}
+	}
+	raddr, err := net.ResolveUDPAddr(network, target)
+	if err != nil {
+		return nil, err
+	}
+	return net.DialUDP(network, laddr, raddr)
+}
