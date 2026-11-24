@@ -1,5 +1,5 @@
 [Unit]
-Description=Go gRPC Audio Sharer Service
+Description=Go Audio Sharer Service
 After=network.target sound.target pulseaudio.service
 
 [Service]

@@ -2,20 +2,15 @@ package client
 
 import (
 	"context"
-	"io"
+	"errors"
 	"log"
-	"net"
 	"sync"
 	"time"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	"go-audio-sharer/internal/audio"
 	"go-audio-sharer/internal/config"
 	"go-audio-sharer/internal/netutil"
-	pb "go-audio-sharer/proto"
+	"go-audio-sharer/internal/udpstream"
 )
 
 const (
@@ -234,34 +229,24 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	if err != nil {
 		return err
 	}
-	dialer := netutil.NewDialer(localIP)
 
-	conn, err := grpc.NewClient(server,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(_ context.Context, _ string) (net.Conn, error) {
-			return dialer.DialContext(ctx, "tcp", target)
-		}),
-	)
+	conn, err := netutil.DialUDP(localIP, target)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
 
-	c := pb.NewAudioStreamClient(conn)
-
-	// Bound the format handshake with a timeout so a stalled connection
-	// or packet blackhole doesn't hang indefinitely.
-	handshakeCtx, handshakeCancel := context.WithTimeout(ctx, 5*time.Second)
-	fmtInfo, err := c.GetFormat(handshakeCtx, &emptypb.Empty{})
-	handshakeCancel()
+	// Handshake over UDP (HELLO -> ACK/AUDIO) with a 5-second timeout to
+	// negotiate stream format without hanging on unreachable hosts.
+	sess, fmtInfo, err := udpstream.Handshake(ctx, conn, 5*time.Second)
 	if err != nil {
 		return err
 	}
 
 	cfg := audio.Config{
-		SampleRate:    int(fmtInfo.SampleRate),
-		Channels:      int(fmtInfo.Channels),
-		BitsPerSample: int(fmtInfo.BitsPerSample),
+		SampleRate:    fmtInfo.SampleRate,
+		Channels:      fmtInfo.Channels,
+		BitsPerSample: fmtInfo.BitsPerSample,
 		BufferMs:      a.Config().LatencyMs,
 		Device:        a.Config().Device,
 	}
@@ -289,12 +274,11 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	}()
 
 	a.updateStatus("Connected")
-	stream, err := c.GetStream(ctx, &emptypb.Empty{})
-	if err != nil {
-		return err
+	if onConnected != nil {
+		onConnected()
 	}
 
-	// Periodically log audio glitches (silent when everything is healthy).
+	// Periodically log audio and UDP transport glitches (silent when healthy).
 	gapThreshold := max(50*time.Millisecond, 2*time.Duration(cfg.BufferMs)*time.Millisecond)
 	statsDone := make(chan struct{})
 	defer close(statsDone)
@@ -309,33 +293,22 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 				return
 			case <-ticker.C:
 				st := p.TakeStats()
-				if st.Underruns > 0 || st.OverflowTrims > 0 || st.RingDrops > 0 || st.DeviceResets > 0 || st.MaxWriteGap >= gapThreshold {
-					log.Printf("Audio glitches (5s): underruns=%d overflow_trims=%d ring_drops=%d device_resets=%d max_packet_gap=%dms buf=%.1fms",
-						st.Underruns, st.OverflowTrims, st.RingDrops, st.DeviceResets, st.MaxWriteGap.Milliseconds(), p.LatencyMs())
+				ust := sess.TakeStats()
+				if st.Underruns > 0 || st.OverflowTrims > 0 || st.RingDrops > 0 || st.DeviceResets > 0 ||
+					st.MaxWriteGap >= gapThreshold || ust.PacketsLost > 0 || ust.OutOfOrder > 0 {
+					log.Printf("Audio glitches (5s): underruns=%d overflow_trims=%d ring_drops=%d device_resets=%d max_packet_gap=%dms pkt_lost=%d ooo=%d buf=%.1fms",
+						st.Underruns, st.OverflowTrims, st.RingDrops, st.DeviceResets,
+						st.MaxWriteGap.Milliseconds(), ust.PacketsLost, ust.OutOfOrder, p.LatencyMs())
 				}
 			}
 		}
 	}()
 
-	first := true
-	for {
-		in, rerr := stream.Recv()
-		if rerr != nil {
-			if rerr == io.EOF || ctx.Err() != nil {
-				return rerr
-			}
-			return rerr
-		}
-		if first {
-			first = false
-			if onConnected != nil {
-				onConnected()
-			}
-		}
-		if wErr := p.Write(in.Data); wErr != nil {
-			return wErr
-		}
+	runErr := sess.Run(ctx, p.Write)
+	if errors.Is(runErr, udpstream.ErrFormatChanged) {
+		log.Printf("Server audio format changed, reconnecting...")
 	}
+	return runErr
 }
 
 // Volume returns the configured playback volume.

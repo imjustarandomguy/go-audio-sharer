@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// ConnRegistry tracks currently connected audio streaming clients (gRPC and
+// ConnRegistry tracks currently connected audio streaming clients (UDP and
 // WebSocket) by their remote address, so the tray and logs can report them.
 type ConnRegistry struct {
 	mu    sync.Mutex

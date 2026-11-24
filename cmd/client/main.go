@@ -145,7 +145,7 @@ func main() {
 
 			cfg := app.Config()
 
-			serverItem := systray.AddMenuItem("Server", "gRPC server address")
+			serverItem := systray.AddMenuItem("Server", "UDP server address")
 			addrItem := serverItem.AddSubMenuItem(cfg.Server, "")
 			addrItem.Disable()
 			openCfgItem := serverItem.AddSubMenuItem("Open config file…", "Edit the server address in the config JSON")

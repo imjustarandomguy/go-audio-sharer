@@ -1,6 +1,6 @@
 # Go Audio Sharer
 
-A high-performance, low-latency gRPC and WebSocket service for streaming system loopback audio from a **Linux** host across a local network to **cross-platform clients** (Linux, Windows, macOS, or any web browser).
+A high-performance, low-latency UDP and WebSocket service for streaming system loopback audio from a **Linux** host across a local network to **cross-platform clients** (Linux, Windows, macOS, or any web browser).
 
 ## Platform Support
 
@@ -12,7 +12,7 @@ A high-performance, low-latency gRPC and WebSocket service for streaming system 
 
 ## Features
 
-- **Low Latency**: Configurable capture and playback buffer sizes (default 10ms).
+- **Low Latency**: Single-MTU UDP PCM streaming (5 ms packets, zero head-of-line blocking) with lock-free SPSC jitter buffering and adaptive clock-drift compensation.
 - **On-Demand Capture**: Captures and streams audio only while at least one client is connected.
 - **Built-in Web Player**: Zero-install browser player served over HTTP/WebSocket (`:8080` by default) with output device selection.
 - **System Tray UI**: Both the Linux server and the cross-platform client run in the system tray (or headless via `-no-tray`).
@@ -24,9 +24,6 @@ A high-performance, low-latency gRPC and WebSocket service for streaming system 
 ## Build
 
 ```bash
-# Regenerate protobuf code if proto/audio.proto is modified
-./build_proto.sh
-
 # Build the server (Linux) and client (native platform)
 go build -o audio_server ./cmd/server
 go build -o audio_client ./cmd/client
@@ -70,7 +67,7 @@ The server runs on Linux and captures system loopback audio from a PulseAudio or
 
 | Flag         | Description                                          | Default    |
 |--------------|------------------------------------------------------|------------|
-| `-port`      | gRPC port to listen on                               | `5001`     |
+| `-port`      | UDP port to listen on                                | `5001`     |
 | `-device`    | Audio device to loopback from (substring match)      | (default)  |
 | `-buffer-ms` | Capture buffer size in milliseconds                  | `10`       |
 | `-rate`      | Sample rate in Hz                                    | `48000`    |
@@ -86,8 +83,8 @@ The server hosts an embedded web player at `http://<server-ip>:8080` (configurab
 
 ### Server Tray Menu
 
-The server tray menu displays the active gRPC and web player addresses and provides:
-- **Connected clients** count (updated live across gRPC and WebSocket clients)
+The server tray menu displays the active UDP and web player addresses and provides:
+- **Connected clients** count (updated live across UDP and WebSocket clients)
 - **Open Web Player** (launches the web player in the default browser)
 - **Audio Device**: select a specific output device to loop back, or *Default (follow)* to track system default changes
 - **Restart**: re-initialize audio capture

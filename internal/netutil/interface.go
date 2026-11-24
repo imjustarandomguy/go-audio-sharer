@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net"
 	"strings"
-	"time"
 )
 
 // Interface describes a network interface with its IPv4 address.
@@ -117,15 +116,6 @@ func DialTarget(serverAddr string, iface *Interface) (localIP net.IP, target str
 		return nil, net.JoinHostPort(ip.String(), port), nil
 	}
 	return iface.IP, net.JoinHostPort(ip.String(), port), nil
-}
-
-// NewDialer returns a dialer bound to localIP, or a plain dialer when localIP is nil.
-func NewDialer(localIP net.IP) *net.Dialer {
-	d := &net.Dialer{Timeout: 5 * time.Second}
-	if localIP != nil {
-		d.LocalAddr = &net.TCPAddr{IP: localIP}
-	}
-	return d
 }
 
 // DialUDP opens a connected UDP socket to target, optionally bound to localIP

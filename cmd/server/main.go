@@ -18,15 +18,12 @@ import (
 
 	"fyne.io/systray"
 	"github.com/gorilla/websocket"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/peer"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	"go-audio-sharer/internal/audio"
 	"go-audio-sharer/internal/server"
 	"go-audio-sharer/internal/tray"
+	"go-audio-sharer/internal/udpstream"
 	webpage "go-audio-sharer/internal/web"
-	pb "go-audio-sharer/proto"
 )
 
 var upgrader = websocket.Upgrader{
@@ -106,62 +103,7 @@ func sameDevices(a, b []audio.DeviceDesc) bool {
 	return true
 }
 
-type streamServer struct {
-	pb.UnimplementedAudioStreamServer
-	recorder *audio.Recorder
-	config   audio.Config
-	registry *server.ConnRegistry
-	restart  func()
-}
-
-func remoteAddr(ctx context.Context) string {
-	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
-		return p.Addr.String()
-	}
-	return "unknown"
-}
-
-func (s *streamServer) GetStream(_ *emptypb.Empty, stream pb.AudioStream_GetStreamServer) error {
-	addr := remoteAddr(stream.Context())
-	log.Printf("New client connected: %s", addr)
-	s.registry.Add(addr)
-	defer func() {
-		s.registry.Remove(addr)
-		log.Printf("Client disconnected: %s", addr)
-	}()
-
-	ch := s.recorder.Subscribe()
-	defer s.recorder.Unsubscribe(ch)
-
-	sample := &pb.AudioSample{}
-	for block := range ch {
-		sample.Data = block.Data
-		err := stream.Send(sample)
-		sample.Data = nil
-		block.Release()
-		if err != nil {
-			log.Printf("Error sending stream to %s: %v", addr, err)
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *streamServer) GetFormat(_ context.Context, _ *emptypb.Empty) (*pb.AudioFormat, error) {
-	bytesPerSec := s.config.SampleRate * s.config.Channels * (s.config.BitsPerSample / 8)
-	return &pb.AudioFormat{
-		AverageBytesPerSecond: int32(bytesPerSec),
-		BitsPerSample:         int32(s.config.BitsPerSample),
-		BlockAlign:            int32(s.config.Channels * (s.config.BitsPerSample / 8)),
-		Channels:              int32(s.config.Channels),
-		SampleRate:            int32(s.config.SampleRate),
-		Encoding:              "PCM",
-		Codec:                 "PCM",
-		Timestamp:             time.Now().UTC().Format(time.RFC3339Nano),
-	}, nil
-}
-
-func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, config audio.Config, restart func()) http.HandlerFunc {
+func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, config audio.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -205,7 +147,7 @@ func wsStreamAudio(recorder *audio.Recorder, registry *server.ConnRegistry, conf
 }
 
 func main() {
-	port := flag.String("port", "5001", "Port to listen on")
+	port := flag.String("port", "5001", "UDP port to listen on")
 	bufferMs := flag.Int("buffer-ms", 10, "Buffer size in milliseconds")
 	sampleRate := flag.Int("rate", 48000, "Sample rate")
 	channels := flag.Int("channels", 2, "Number of channels")
@@ -214,16 +156,20 @@ func main() {
 	noTray := flag.Bool("no-tray", false, "Run headless without a system tray icon")
 	flag.Parse()
 
-	lis, err := net.Listen("tcp", fmt.Sprintf(":%s", *port))
+	udpListenAddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%s", *port))
 	if err != nil {
-		log.Fatalf("failed to listen: %v", err)
+		log.Fatalf("invalid UDP listen port: %v", err)
+	}
+	udpConn, err := net.ListenUDP("udp", udpListenAddr)
+	if err != nil {
+		log.Fatalf("failed to listen on UDP: %v", err)
 	}
 
-	gRPCAddr := fmt.Sprintf(":%s", *port)
+	udpAddrStr := fmt.Sprintf(":%s", *port)
 	webURL := localURL(*webAddr)
-	grpcDisplay := gRPCAddr
-	if strings.HasPrefix(grpcDisplay, ":") {
-		grpcDisplay = "127.0.0.1" + grpcDisplay
+	udpDisplay := udpAddrStr
+	if strings.HasPrefix(udpDisplay, ":") {
+		udpDisplay = "127.0.0.1" + udpDisplay
 	}
 
 	config := audio.Config{
@@ -243,20 +189,16 @@ func main() {
 	defer recorder.Close()
 
 	registry := server.NewConnRegistry()
-	ss := &streamServer{
-		recorder: recorder,
-		config:   config,
-		registry: registry,
-		restart:  recorder.Restart,
-	}
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterAudioStreamServer(grpcServer, ss)
+	udpServer := udpstream.NewServer(udpConn, recorder, udpstream.Format{
+		SampleRate:    config.SampleRate,
+		Channels:      config.Channels,
+		BitsPerSample: config.BitsPerSample,
+	}, registry)
 
 	httpServer := &http.Server{}
 	go func() {
 		mux := http.NewServeMux()
-		mux.HandleFunc("/ws", wsStreamAudio(recorder, registry, config, recorder.Restart))
+		mux.HandleFunc("/ws", wsStreamAudio(recorder, registry, config))
 		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write([]byte(webpage.IndexHTML))
@@ -270,9 +212,9 @@ func main() {
 	}()
 
 	go func() {
-		log.Printf("gRPC server listening on %v", lis.Addr())
-		if err := grpcServer.Serve(lis); err != nil {
-			log.Fatalf("failed to serve: %v", err)
+		log.Printf("UDP audio server listening on %v", udpConn.LocalAddr())
+		if err := udpServer.Serve(); err != nil {
+			log.Fatalf("UDP server failed: %v", err)
 		}
 	}()
 
@@ -305,9 +247,7 @@ func main() {
 		default:
 			close(statsStop)
 		}
-		// Use Stop(), not GracefulStop(): GracefulStop waits for active streaming
-		// RPCs (GetStream), which never end while a client stays connected.
-		grpcServer.Stop()
+		udpServer.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(ctx)
@@ -323,7 +263,7 @@ func main() {
 
 	onReady := func() {
 		systray.SetIcon(tray.ServerIcon())
-		systray.SetTooltip(fmt.Sprintf("Audio Sharer Server (%s)", grpcDisplay))
+		systray.SetTooltip(fmt.Sprintf("Audio Sharer Server (%s/udp)", udpDisplay))
 
 		var statusItem *systray.MenuItem
 		var clientsItem *systray.MenuItem
@@ -360,7 +300,7 @@ func main() {
 			menuCtx, menuCancel = context.WithCancel(context.Background())
 
 			systray.ResetMenu()
-			statusItem = systray.AddMenuItem(fmt.Sprintf("Status: Running (%s)", grpcDisplay), "")
+			statusItem = systray.AddMenuItem(fmt.Sprintf("Status: Running (%s/udp)", udpDisplay), "")
 			statusItem.Disable()
 
 			webItem := systray.AddMenuItem("Open Web Player", "Open the web client in a browser")
@@ -398,8 +338,8 @@ func main() {
 				_ = execCommand(webURL)
 			})
 			onClick(menuCtx, restartItem, func() {
-				ss.restart()
-				statusItem.SetTitle(fmt.Sprintf("Status: Running (%s)", grpcDisplay))
+				recorder.Restart()
+				statusItem.SetTitle(fmt.Sprintf("Status: Running (%s/udp)", udpDisplay))
 				rebuildClients()
 			})
 			onClick(menuCtx, quitItem, func() {
