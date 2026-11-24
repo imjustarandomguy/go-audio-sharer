@@ -133,13 +133,14 @@ func (b *Broadcaster) Broadcast(block CapturedBlock) {
 			select {
 			case old := <-ch:
 				old.Release()
+				b.dropped.Add(1)
 			default:
 			}
-			b.dropped.Add(1)
 			select {
 			case ch <- block:
 			default:
 				block.Release()
+				b.dropped.Add(1)
 			}
 		}
 	}

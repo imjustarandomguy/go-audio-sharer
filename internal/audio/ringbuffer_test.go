@@ -181,3 +181,51 @@ func TestByteRingBufferConcurrentSPSC(t *testing.T) {
 		t.Fatalf("expected empty ring after full SPSC transfer, got %d", rb.Len())
 	}
 }
+
+func TestByteRingBufferWriteAlignedWrapAndUnalignedFree(t *testing.T) {
+	// Cap = 16; use 6-byte frames so 16 is not a multiple of frameBytes.
+	rb := newByteRingBuffer(16)
+	if n := rb.WriteAligned(make([]byte, 18), 6); n != 12 {
+		t.Fatalf("WriteAligned = %d, want 12", n)
+	}
+	// Only 4 bytes free (< 6), so another WriteAligned(6) must write 0.
+	if n := rb.WriteAligned(make([]byte, 6), 6); n != 0 {
+		t.Fatalf("WriteAligned with < frameBytes free = %d, want 0", n)
+	}
+	// Read 6 bytes -> 10 bytes free -> WriteAligned(12, 6) writes 6 bytes wrapping around.
+	out := make([]byte, 6)
+	rb.Read(out)
+	if n := rb.WriteAligned([]byte("ABCDEF123456"), 6); n != 6 {
+		t.Fatalf("WriteAligned wrap = %d, want 6", n)
+	}
+	if rb.Len()%6 != 0 {
+		t.Fatalf("Len %d is not aligned to 6-byte frame", rb.Len())
+	}
+}
+
+func TestByteRingBufferConcurrentWriteAlignedAndReset(t *testing.T) {
+	// Verifies the SPSC Reset contract relied on by Player.followDefault:
+	// consumer is stopped while Reset() advances tail concurrently with WriteAligned().
+	rb := newByteRingBuffer(1024)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+		chunk := make([]byte, 64)
+		for i := 0; i < 5000; i++ {
+			rb.WriteAligned(chunk, 4)
+		}
+	}()
+
+	for i := 0; i < 500; i++ {
+		rb.Reset()
+		if rb.Len()%4 != 0 {
+			t.Fatalf("unaligned Len %d after concurrent Reset", rb.Len())
+		}
+	}
+	<-done
+	rb.Reset()
+	if rb.Len() != 0 {
+		t.Fatalf("expected Len 0 after final Reset, got %d", rb.Len())
+	}
+}

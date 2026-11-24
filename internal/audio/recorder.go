@@ -222,7 +222,7 @@ func (r *Recorder) onData(_, in []byte, framecount uint32) {
 	if len(in) == 0 {
 		return
 	}
-	now := time.Now().UnixNano()
+	now := monoNowNs()
 	if prev := r.lastCaptureNs.Swap(now); prev > 0 && now > prev {
 		recordMaxInt64(&r.maxCaptureGapNs, now-prev)
 	}

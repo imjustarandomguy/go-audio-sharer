@@ -99,6 +99,14 @@ type Player struct {
 	maxWriteGapNs atomic.Int64
 }
 
+var monoEpoch = time.Now()
+
+// monoNowNs returns a strictly positive monotonic nanosecond timestamp immune
+// to wall-clock / NTP adjustments, with zero heap allocations.
+func monoNowNs() int64 {
+	return int64(time.Since(monoEpoch)) + 1
+}
+
 func recordMaxInt64(dst *atomic.Int64, val int64) {
 	for {
 		cur := dst.Load()
@@ -240,7 +248,7 @@ func (p *Player) frameBytes() int {
 }
 
 func (p *Player) Write(data []byte) error {
-	now := time.Now().UnixNano()
+	now := monoNowNs()
 	if prev := p.lastWriteNs.Swap(now); prev > 0 && now > prev {
 		recordMaxInt64(&p.maxWriteGapNs, now-prev)
 	}
@@ -692,6 +700,7 @@ func (p *Player) Stop() {
 	}
 	p.ring.Reset()
 	p.pb.reset()
+	p.lastWriteNs.Store(0)
 }
 
 // LatencyMs returns the approximate current playback latency in milliseconds,

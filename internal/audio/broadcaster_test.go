@@ -149,3 +149,42 @@ func TestBroadcasterPooledBlocksConcurrent(t *testing.T) {
 	r.broadcaster.UnsubscribeWithChan(ch2)
 	wg.Wait()
 }
+
+func TestBroadcasterDropOldestReleasesPooledBuffers(t *testing.T) {
+	r := &Recorder{
+		broadcaster: NewBroadcaster(nil, nil),
+	}
+	ch := r.broadcaster.SubscribeWithChan()
+
+	// Allocate and broadcast more pooled blocks than subscriberQueueSize without reading.
+	total := subscriberQueueSize + 5
+	bufs := make([]*pooledBuf, total)
+	for i := 0; i < total; i++ {
+		blk := r.allocBlock([]byte{byte(i)})
+		// Detach from sync.Pool so we can inspect ref counts deterministically.
+		blk.buf.pool = nil
+		bufs[i] = blk.buf
+		r.broadcaster.Broadcast(blk)
+	}
+
+	// The oldest 5 dropped blocks must already have refs == 0.
+	for i := 0; i < 5; i++ {
+		if got := bufs[i].refs.Load(); got != 0 {
+			t.Fatalf("dropped pooled block %d refs = %d, want 0", i, got)
+		}
+	}
+	// The newest subscriberQueueSize queued blocks must still have refs == 1.
+	for i := 5; i < total; i++ {
+		if got := bufs[i].refs.Load(); got != 1 {
+			t.Fatalf("queued pooled block %d refs = %d, want 1", i, got)
+		}
+	}
+
+	// Unsubscribing must drain and release all remaining queued blocks to refs == 0.
+	r.broadcaster.UnsubscribeWithChan(ch)
+	for i := 5; i < total; i++ {
+		if got := bufs[i].refs.Load(); got != 0 {
+			t.Fatalf("unsubscribed pooled block %d refs = %d, want 0", i, got)
+		}
+	}
+}

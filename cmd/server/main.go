@@ -277,6 +277,7 @@ func main() {
 	}()
 
 	// Periodically log capture/broadcast glitches (silent when healthy).
+	gapThreshold := max(50*time.Millisecond, 2*time.Duration(config.BufferMs)*time.Millisecond)
 	statsStop := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)
@@ -287,7 +288,7 @@ func main() {
 				return
 			case <-ticker.C:
 				st := recorder.TakeStats()
-				if st.DroppedBlocks > 0 || st.MaxCaptureGap >= 50*time.Millisecond {
+				if st.DroppedBlocks > 0 || st.MaxCaptureGap >= gapThreshold {
 					log.Printf("Capture glitches (5s): dropped_blocks=%d max_capture_gap=%dms clients=%d",
 						st.DroppedBlocks, st.MaxCaptureGap.Milliseconds(), registry.Count())
 				}

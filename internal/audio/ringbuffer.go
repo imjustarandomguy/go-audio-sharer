@@ -1,6 +1,7 @@
 package audio
 
 import (
+	"math/bits"
 	"sync/atomic"
 )
 
@@ -41,6 +42,10 @@ func newByteRingBuffer(capacity int) *byteRingBuffer {
 func nextPowerOfTwo(n int) int {
 	if n <= 1 {
 		return 1
+	}
+	const maxPow2 = 1 << (bits.UintSize - 2)
+	if n >= maxPow2 {
+		return maxPow2
 	}
 	v := 1
 	for v < n {

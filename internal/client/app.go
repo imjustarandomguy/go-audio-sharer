@@ -295,6 +295,7 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 	}
 
 	// Periodically log audio glitches (silent when everything is healthy).
+	gapThreshold := max(50*time.Millisecond, 2*time.Duration(cfg.BufferMs)*time.Millisecond)
 	statsDone := make(chan struct{})
 	defer close(statsDone)
 	go func() {
@@ -308,7 +309,7 @@ func (a *App) connectAndStream(ctx context.Context, onConnected func()) error {
 				return
 			case <-ticker.C:
 				st := p.TakeStats()
-				if st.Underruns > 0 || st.OverflowTrims > 0 || st.RingDrops > 0 || st.DeviceResets > 0 || st.MaxWriteGap >= 50*time.Millisecond {
+				if st.Underruns > 0 || st.OverflowTrims > 0 || st.RingDrops > 0 || st.DeviceResets > 0 || st.MaxWriteGap >= gapThreshold {
 					log.Printf("Audio glitches (5s): underruns=%d overflow_trims=%d ring_drops=%d device_resets=%d max_packet_gap=%dms buf=%.1fms",
 						st.Underruns, st.OverflowTrims, st.RingDrops, st.DeviceResets, st.MaxWriteGap.Milliseconds(), p.LatencyMs())
 				}
