@@ -38,21 +38,23 @@ const (
 // playbackState holds consumer-only state accessed exclusively from the
 // miniaudio real-time audio callback (or after device.Stop()).
 type playbackState struct {
-	playing      bool
-	hasCurr      bool
-	hasLastOut   bool
-	prevFrame    [maxResampleChannels]int16
-	currFrame    [maxResampleChannels]int16
-	lastOutFrame [maxResampleChannels]int16
-	phase        float64
-	fillEMA      float64
-	integral     float64
-	fadeInRem    int
-	fadeInLen    int
-	fadeFromLast bool
-	scratch      []byte
-	scratchOff   int
-	scratchLen   int
+	playing        bool
+	hasCurr        bool
+	hasLastOut     bool
+	prevFrame      [maxResampleChannels]int16
+	currFrame      [maxResampleChannels]int16
+	lastOutFrame   [maxResampleChannels]int16
+	fadeStartFrame [maxResampleChannels]int16
+	phase          float64
+	fillEMA        float64
+	chunkEMA       float64
+	integral       float64
+	fadeInRem      int
+	fadeInLen      int
+	fadeFromLast   bool
+	scratch        []byte
+	scratchOff     int
+	scratchLen     int
 }
 
 func (s *playbackState) reset() {
@@ -61,6 +63,7 @@ func (s *playbackState) reset() {
 	s.hasLastOut = false
 	s.phase = 0
 	s.fillEMA = 0
+	s.chunkEMA = 0
 	s.integral = 0
 	s.fadeInRem = 0
 	s.fadeInLen = 0
@@ -255,10 +258,10 @@ func (p *Player) Write(data []byte) error {
 	fb := p.frameBytes()
 	aligned := (len(data) / fb) * fb
 	if aligned > 0 {
-		// Track observed incoming chunk granularity (capped at 50 ms so burst
-		// writes don't inflate steady-state latency) to avoid underrun loops
-		// when server chunks are larger than the client's callback period.
-		chunkCap := p.bytesForMs(50)
+		// Track observed incoming chunk granularity (capped at 100 ms so large
+		// stall bursts don't inflate steady-state latency) to avoid underrun
+		// loops when server chunks are larger than the client's callback period.
+		chunkCap := p.bytesForMs(100)
 		tracked := aligned
 		if chunkCap > 0 && tracked > chunkCap {
 			tracked = chunkCap
@@ -273,13 +276,13 @@ func (p *Player) Write(data []byte) error {
 }
 
 func (p *Player) bytesForMs(ms int) int {
-	frameBytes := p.frameBytes()
-	bytesPerSec := p.config.SampleRate * frameBytes
+	frameBytes := int64(p.frameBytes())
+	bytesPerSec := int64(p.config.SampleRate) * frameBytes
 	if bytesPerSec <= 0 || ms <= 0 {
 		return 0
 	}
-	raw := (bytesPerSec * ms) / 1000
-	return (raw / frameBytes) * frameBytes
+	raw := (bytesPerSec * int64(ms)) / 1000
+	return int((raw / frameBytes) * frameBytes)
 }
 
 // targetPendingBytes returns the desired jitter-buffer cushion (in bytes)
@@ -332,6 +335,9 @@ func (p *Player) startFadeIn(fromLast bool) {
 	p.pb.fadeInLen = f
 	p.pb.fadeInRem = f
 	p.pb.fadeFromLast = fromLast && p.pb.hasLastOut
+	if p.pb.fadeFromLast {
+		p.pb.fadeStartFrame = p.pb.lastOutFrame
+	}
 }
 
 // onData is called by miniaudio on its real-time audio thread.
@@ -344,16 +350,25 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 	frameBytes := p.frameBytes()
 	targetCushion := p.targetPendingBytes()
 
-	// Account for both the local callback period and observed server packet
-	// granularity, plus 1 frame for the linear interpolator's lookahead.
+	// Smooth observed incoming chunk granularity with the same slow EMA as
+	// fillEMA so transient PipeWire/network chunk fluctuations don't step
+	// targetFrames and cause pitch wobble, while steady-state larger server
+	// chunks are absorbed without underrun or trim loops.
+	if obs := int(p.lastWriteBytes.Load()); obs > 0 {
+		if p.pb.chunkEMA == 0 {
+			p.pb.chunkEMA = float64(obs)
+		} else {
+			p.pb.chunkEMA += driftEMAAlpha * (float64(obs) - p.pb.chunkEMA)
+		}
+	}
 	periodBytes := len(out)
-	if obs := int(p.lastWriteBytes.Load()); obs > periodBytes {
-		periodBytes = obs
+	if smoothed := (int(math.Round(p.pb.chunkEMA)) / frameBytes) * frameBytes; smoothed > periodBytes {
+		periodBytes = smoothed
 	}
 	targetBefore := targetCushion + periodBytes + frameBytes
 
 	// Never let targetBefore exceed ring capacity (prevents permanent silence deadlock).
-	maxSafeTarget := ((p.ring.Cap() * 3 / 4) / frameBytes) * frameBytes
+	maxSafeTarget := (((p.ring.Cap() / 4) * 3) / frameBytes) * frameBytes
 	if maxSafeTarget < len(out)+frameBytes {
 		maxSafeTarget = ((p.ring.Cap() - frameBytes) / frameBytes) * frameBytes
 	}
@@ -362,7 +377,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 	}
 
 	maxBytes := p.maxPendingBytes()
-	headroom := len(out)
+	headroom := periodBytes
 	if h20 := p.bytesForMs(20); h20 > headroom {
 		headroom = h20
 	}
@@ -426,7 +441,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 	channels := p.config.Channels
 	if p.config.BitsPerSample != 16 || channels <= 0 || channels > maxResampleChannels || p.config.SampleRate <= 0 {
 		n := p.ring.Read(out)
-		if vol != 1.0 {
+		if vol != 1.0 && p.config.BitsPerSample == 16 {
 			scaleS16(out[:n], vol)
 		}
 		clear(out[n:])
@@ -517,7 +532,7 @@ func (p *Player) onData(out, _ []byte, framecount uint32) {
 			sample := (s0 + ph*(s1-s0)) * vol
 			if fading {
 				if p.pb.fadeFromLast {
-					sample = float64(p.pb.lastOutFrame[c])*(1.0-ramp) + sample*ramp
+					sample = float64(p.pb.fadeStartFrame[c])*(1.0-ramp) + sample*ramp
 				} else {
 					sample *= ramp
 				}
@@ -701,6 +716,7 @@ func (p *Player) Stop() {
 	p.ring.Reset()
 	p.pb.reset()
 	p.lastWriteNs.Store(0)
+	p.lastWriteBytes.Store(0)
 }
 
 // LatencyMs returns the approximate current playback latency in milliseconds,

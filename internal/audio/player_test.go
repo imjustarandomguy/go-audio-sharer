@@ -294,6 +294,88 @@ func TestPlayerOverflowTrimCrossfadeNoZeroStep(t *testing.T) {
 	}
 }
 
+func TestPlayerMultiCallbackCrossfadeSmoothness(t *testing.T) {
+	// Callback smaller than fadeInLen (48 frames = 1 ms vs 96 frames = 2 ms @ 48 kHz).
+	// Verifies fadeStartFrame is preserved across callback boundaries without mid-fade clicks.
+	cfg := Config{
+		SampleRate:    48000,
+		Channels:      2,
+		BitsPerSample: 16,
+		BufferMs:      10,
+	}
+	p := newTestPlayer(cfg)
+	out := make([]byte, 48*4) // 1 ms callback
+
+	// Pre-fill and run 3 callbacks (> 2 ms) of +20000 so lastOutFrame == +20000.
+	for i := 0; i < 4; i++ {
+		_ = p.Write(makeStereoChunk(480, 20000, 20000))
+	}
+	for i := 0; i < 3; i++ {
+		p.onData(out, nil, 48)
+	}
+	if got := SampleAsInt16(out[len(out)-4 : len(out)-2]); got != 20000 {
+		t.Fatalf("pre-trim last sample = %d, want 20000", got)
+	}
+
+	// Overflow the buffer with -20000 so the next callback triggers a trim crossfade
+	// spanning 2 callbacks (96 frames total = 48 + 48).
+	for p.ring.Len() <= p.maxPendingBytes()+20000 {
+		_ = p.Write(makeStereoChunk(480, -20000, -20000))
+	}
+
+	prev := int16(20000)
+	for cb := 0; cb < 2; cb++ {
+		p.onData(out, nil, 48)
+		for i := 0; i < 48; i++ {
+			s := SampleAsInt16(out[i*4 : i*4+2])
+			// Expected linear step from +20000 to -20000 over 96 frames is ~417/frame.
+			diff := math.Abs(float64(s) - float64(prev))
+			if diff > 600 {
+				t.Fatalf("crossfade discontinuity at callback %d frame %d: prev=%d cur=%d (diff=%.0f)", cb, i, prev, s, diff)
+			}
+			prev = s
+		}
+	}
+	if prev != -20000 {
+		t.Fatalf("crossfade did not reach target -20000 after 2 callbacks, got %d", prev)
+	}
+}
+
+func TestPlayerLargeServerChunksNoTrimLoop(t *testing.T) {
+	for _, chunkMs := range []int{35, 60} {
+		cfg := Config{
+			SampleRate:    48000,
+			Channels:      2,
+			BitsPerSample: 16,
+			BufferMs:      10,
+		}
+		p := newTestPlayer(cfg)
+		out := make([]byte, 480*4) // 10 ms client callback
+		chunkFrames := (48000 * chunkMs) / 1000
+
+		started := false
+		for ms := 0; ms < 2000; ms += 10 {
+			if ms%chunkMs < 10 {
+				_ = p.Write(makeStereoChunk(chunkFrames, 3000, -3000))
+			}
+			p.onData(out, nil, 480)
+			if p.pb.playing {
+				started = true
+			} else if started {
+				t.Fatalf("chunkMs=%d: unexpected underrun at t=%dms", chunkMs, ms)
+			}
+		}
+		if !started {
+			t.Fatalf("chunkMs=%d: player never left pre-buffering", chunkMs)
+		}
+		st := p.TakeStats()
+		if st.OverflowTrims != 0 || st.Underruns != 0 {
+			t.Fatalf("chunkMs=%d: expected 0 trims and 0 underruns, got trims=%d underruns=%d",
+				chunkMs, st.OverflowTrims, st.Underruns)
+		}
+	}
+}
+
 func TestPlayerLargeLatencyDoesNotDeadlock(t *testing.T) {
 	cfg := Config{
 		SampleRate:    48000,
