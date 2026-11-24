@@ -117,3 +117,77 @@ func TestDeviceMonitorConfirmedChange(t *testing.T) {
 		t.Fatalf("expected no duplicate change callback, got %d", changes.Load())
 	}
 }
+
+func TestDeviceMonitorCloseCancelsMidDebounce(t *testing.T) {
+	devA := fakeDeviceInfo('A')
+	devB := fakeDeviceInfo('B')
+
+	enteredPoll := make(chan struct{}, 1)
+	var changes atomic.Int32
+
+	dm := newDeviceMonitorWith(
+		func() (*malgo.DeviceInfo, error) {
+			select {
+			case enteredPoll <- struct{}{}:
+			default:
+			}
+			return devB, nil
+		},
+		10*time.Millisecond,
+		5*time.Second, // long debounce so close() must abort it immediately
+		"",
+		func(info *malgo.DeviceInfo) {
+			changes.Add(1)
+		},
+	)
+	dm.setCurrent(devA.ID.String())
+
+	// Wait until run() enters pollOnce and hits the debounce wait.
+	select {
+	case <-enteredPoll:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for pollOnce")
+	}
+
+	start := time.Now()
+	dm.close()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("close() blocked for %v instead of cancelling debounce immediately", elapsed)
+	}
+	if changes.Load() != 0 {
+		t.Fatalf("expected no onChange callback after close() cancelled debounce, got %d", changes.Load())
+	}
+}
+
+func TestDeviceMonitorSetFilterDuringDebounceSuppressesChange(t *testing.T) {
+	devA := fakeDeviceInfo('A')
+	devB := fakeDeviceInfo('B')
+
+	var changes atomic.Int32
+	dm := &DeviceMonitor{
+		pollFn: func() (*malgo.DeviceInfo, error) {
+			return devB, nil
+		},
+		debounce: 40 * time.Millisecond,
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
+		onChange: func(info *malgo.DeviceInfo) {
+			changes.Add(1)
+		},
+	}
+	dm.setCurrent(devA.ID.String())
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		dm.pollOnce()
+	}()
+
+	time.Sleep(10 * time.Millisecond)
+	dm.setFilter("Pinned Device")
+	<-done
+
+	if changes.Load() != 0 {
+		t.Fatalf("expected setFilter during debounce to suppress onChange, got %d", changes.Load())
+	}
+}

@@ -43,11 +43,7 @@ type Recorder struct {
 func NewRecorder(cfg Config) (*Recorder, error) {
 	// Prefer PulseAudio on Linux for loopback support (ALSA has no loopback);
 	// falls back to ALSA/JACK where no PulseAudio server exists.
-	c, err := newAudioContextWith([]malgo.Backend{
-		malgo.BackendPulseaudio,
-		malgo.BackendAlsa,
-		malgo.BackendJack,
-	})
+	c, err := newAudioContextWith(recorderBackends)
 	if err != nil {
 		return nil, err
 	}
@@ -57,7 +53,7 @@ func NewRecorder(cfg Config) (*Recorder, error) {
 		config: cfg,
 	}
 	r.broadcaster = NewBroadcaster(r.startRecording, r.stopRecording)
-	r.monitor = newDeviceMonitor(cfg.Device, func(info *malgo.DeviceInfo) {
+	r.monitor = newDeviceMonitorForBackends("recorder", recorderBackends, cfg.Device, func(info *malgo.DeviceInfo) {
 		r.handleDeviceChange(info)
 	})
 	return r, nil

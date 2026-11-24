@@ -1,7 +1,9 @@
 package audio
 
 import (
+	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +14,18 @@ import (
 const (
 	devicePollInterval = 5 * time.Second
 	deviceDebounce     = 250 * time.Millisecond
+)
+
+var (
+	errNoPlaybackDevice = errors.New("no playback device available")
+
+	// recorderBackends matches Recorder's preferred backend order on Linux
+	// (PulseAudio first for monitor loopback support, avoiding the null backend).
+	recorderBackends = []malgo.Backend{
+		malgo.BackendPulseaudio,
+		malgo.BackendAlsa,
+		malgo.BackendJack,
+	}
 )
 
 // newAudioContext creates the process audio context (miniaudio).
@@ -52,7 +66,7 @@ func playbackDevice(ctx malgo.Context, filter string) (*malgo.DeviceInfo, error)
 	if len(devs) > 0 {
 		return &devs[0], nil
 	}
-	return nil, fmt.Errorf("no playback device available")
+	return nil, errNoPlaybackDevice
 }
 
 // listPlaybackDevices returns all playback devices for UI display.
@@ -67,41 +81,73 @@ type DeviceDesc struct {
 	IsDefault bool
 }
 
+type discoveryReq struct {
+	key      string
+	backends []malgo.Backend
+	fn       func(malgo.Context) error
+	resp     chan error
+}
+
 var (
-	discoveryMu  sync.Mutex
-	discoveryCtx *malgo.AllocatedContext
+	discoveryOnce sync.Once
+	discoveryCh   chan discoveryReq
 )
 
-// withDiscoveryContext runs fn against a shared, isolated discovery audio
-// context serialized by discoveryMu. Isolating enumeration from the live
-// streaming malgo.Context prevents OS driver / PulseAudio mainloop locks from
-// stalling active audio callbacks.
-func withDiscoveryContext(fn func(malgo.Context) error) error {
-	discoveryMu.Lock()
-	defer discoveryMu.Unlock()
+func startDiscoveryWorker() {
+	discoveryCh = make(chan discoveryReq)
+	go func() {
+		// Pin the discovery worker to a single OS thread so Windows WASAPI
+		// CoInitializeEx / CoCreateInstance / CoUninitialize always execute
+		// on the same thread (preserving COM apartment and refcount invariants).
+		runtime.LockOSThread()
+		ctxs := make(map[string]*malgo.AllocatedContext)
 
-	if discoveryCtx == nil {
-		c, err := newAudioContext()
-		if err != nil {
-			return err
+		for req := range discoveryCh {
+			c := ctxs[req.key]
+			if c == nil {
+				var err error
+				c, err = newAudioContextWith(req.backends)
+				if err != nil {
+					req.resp <- err
+					continue
+				}
+				ctxs[req.key] = c
+			}
+
+			err := req.fn(c.Context)
+			// Only tear down and reinitialize the context on actual backend
+			// failures, not when zero playback devices are currently attached.
+			if err != nil && !errors.Is(err, errNoPlaybackDevice) {
+				_ = c.Uninit()
+				c.Free()
+				delete(ctxs, req.key)
+
+				c2, err2 := newAudioContextWith(req.backends)
+				if err2 != nil {
+					req.resp <- err2
+					continue
+				}
+				ctxs[req.key] = c2
+				err = req.fn(c2.Context)
+			}
+			req.resp <- err
 		}
-		discoveryCtx = c
-	}
+	}()
+}
 
-	if err := fn(discoveryCtx.Context); err != nil {
-		// If querying failed (e.g. audio server restarted), invalidate and retry once.
-		_ = discoveryCtx.Uninit()
-		discoveryCtx.Free()
-		discoveryCtx = nil
-
-		c, err2 := newAudioContext()
-		if err2 != nil {
-			return err2
-		}
-		discoveryCtx = c
-		return fn(discoveryCtx.Context)
+// withDiscoveryContext runs fn against an isolated, OS-thread-pinned discovery
+// audio context. Isolating enumeration from the live streaming malgo.Context
+// prevents OS driver / PulseAudio mainloop locks from stalling audio callbacks.
+func withDiscoveryContext(key string, backends []malgo.Backend, fn func(malgo.Context) error) error {
+	discoveryOnce.Do(startDiscoveryWorker)
+	resp := make(chan error, 1)
+	discoveryCh <- discoveryReq{
+		key:      key,
+		backends: backends,
+		fn:       fn,
+		resp:     resp,
 	}
-	return nil
+	return <-resp
 }
 
 // ListPlaybackDeviceDescriptions returns the playback devices for display.
@@ -109,7 +155,7 @@ func withDiscoveryContext(fn func(malgo.Context) error) error {
 // audio driver on every poll.
 func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
 	var desc []DeviceDesc
-	err := withDiscoveryContext(func(ctx malgo.Context) error {
+	err := withDiscoveryContext("default", nil, func(ctx malgo.Context) error {
 		var err error
 		desc, err = ListPlaybackDeviceDescriptionsWith(ctx)
 		return err
@@ -117,9 +163,9 @@ func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
 	return desc, err
 }
 
-func defaultPlaybackDeviceFromDiscovery() (*malgo.DeviceInfo, error) {
+func defaultPlaybackDeviceFromDiscovery(key string, backends []malgo.Backend) (*malgo.DeviceInfo, error) {
 	var info *malgo.DeviceInfo
-	err := withDiscoveryContext(func(ctx malgo.Context) error {
+	err := withDiscoveryContext(key, backends, func(ctx malgo.Context) error {
 		var err error
 		info, err = playbackDevice(ctx, "")
 		return err
@@ -191,7 +237,14 @@ type DeviceMonitor struct {
 }
 
 func newDeviceMonitor(filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
-	return newDeviceMonitorWith(defaultPlaybackDeviceFromDiscovery, devicePollInterval, deviceDebounce, filter, onChange)
+	return newDeviceMonitorForBackends("default", nil, filter, onChange)
+}
+
+func newDeviceMonitorForBackends(key string, backends []malgo.Backend, filter string, onChange func(*malgo.DeviceInfo)) *DeviceMonitor {
+	pollFn := func() (*malgo.DeviceInfo, error) {
+		return defaultPlaybackDeviceFromDiscovery(key, backends)
+	}
+	return newDeviceMonitorWith(pollFn, devicePollInterval, deviceDebounce, filter, onChange)
 }
 
 func newDeviceMonitorWith(
