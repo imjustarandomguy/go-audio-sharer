@@ -66,7 +66,7 @@ func TestDeviceMonitorDebounceTransientGlitch(t *testing.T) {
 	var changes atomic.Int32
 
 	dm := &DeviceMonitor{
-		pollFn: func() (*malgo.DeviceInfo, error) {
+		pollFn: func(_ string) (*malgo.DeviceInfo, error) {
 			// First poll sees transient B, confirmation re-poll returns back to A.
 			if calls.Add(1) == 1 {
 				return devB, nil
@@ -95,7 +95,7 @@ func TestDeviceMonitorConfirmedChange(t *testing.T) {
 
 	var changes atomic.Int32
 	dm := &DeviceMonitor{
-		pollFn: func() (*malgo.DeviceInfo, error) {
+		pollFn: func(_ string) (*malgo.DeviceInfo, error) {
 			return devB, nil
 		},
 		debounce: 10 * time.Millisecond,
@@ -126,7 +126,7 @@ func TestDeviceMonitorRetriesFailedOnChange(t *testing.T) {
 
 	var attempts atomic.Int32
 	dm := &DeviceMonitor{
-		pollFn: func() (*malgo.DeviceInfo, error) {
+		pollFn: func(_ string) (*malgo.DeviceInfo, error) {
 			return devB, nil
 		},
 		debounce: 5 * time.Millisecond,
@@ -160,7 +160,7 @@ func TestDeviceMonitorRetriesAfterFallbackToPreviousDevice(t *testing.T) {
 	var attempts atomic.Int32
 
 	dm := &DeviceMonitor{
-		pollFn: func() (*malgo.DeviceInfo, error) {
+		pollFn: func(_ string) (*malgo.DeviceInfo, error) {
 			return active.Load(), nil
 		},
 		debounce: 5 * time.Millisecond,
@@ -192,6 +192,102 @@ func TestDeviceMonitorRetriesAfterFallbackToPreviousDevice(t *testing.T) {
 	}
 }
 
+func TestDeviceMonitorMarkDirtyReopensSameGUIDAfterDockReplug(t *testing.T) {
+	// Simulates a USB-C dock unplugged and replugged with the exact same WASAPI
+	// endpoint GUID (devA): markDirty from miniaudio Stop callback must reopen it.
+	devA := fakeDeviceInfo('A')
+	var dockPresent atomic.Bool
+
+	reopened := make(chan struct{}, 1)
+	dm := newDeviceMonitorWith(
+		func(_ string) (*malgo.DeviceInfo, error) {
+			if !dockPresent.Load() {
+				return nil, errNoPlaybackDevice
+			}
+			return devA, nil
+		},
+		20*time.Millisecond,
+		5*time.Millisecond,
+		"",
+		func(info *malgo.DeviceInfo) bool {
+			select {
+			case reopened <- struct{}{}:
+			default:
+			}
+			return true
+		},
+	)
+	defer dm.close()
+
+	dm.setCurrent(devA.ID.String())
+
+	// Dock unplugged -> unexpected Stop callback calls markDirty().
+	dm.markDirty()
+	time.Sleep(35 * time.Millisecond)
+
+	// Dock replugged with the exact same GUID.
+	dockPresent.Store(true)
+	select {
+	case <-reopened:
+	case <-time.After(time.Second):
+		t.Fatal("expected DeviceMonitor to reopen same-GUID device after dock replug")
+	}
+}
+
+func TestDeviceMonitorPinnedDeviceReopensAfterDockReplug(t *testing.T) {
+	// Simulates a pinned dock device ("USB Dock DAC") unplugged and reattached.
+	dockDev := fakeDeviceInfo('D')
+	var dockPresent atomic.Bool
+	var attempts atomic.Int32
+
+	dm := &DeviceMonitor{
+		filter: "USB Dock DAC",
+		pollFn: func(filter string) (*malgo.DeviceInfo, error) {
+			if filter != "USB Dock DAC" || !dockPresent.Load() {
+				return nil, errNoPlaybackDevice
+			}
+			return dockDev, nil
+		},
+		debounce: 5 * time.Millisecond,
+		wakeCh:   make(chan struct{}, 1),
+		stopCh:   make(chan struct{}),
+		done:     make(chan struct{}),
+		onChange: func(info *malgo.DeviceInfo) bool {
+			attempts.Add(1)
+			return true
+		},
+	}
+	dm.setCurrent(dockDev.ID.String())
+
+	// While healthy (not dirty), pollOnce is a no-op for pinned devices.
+	dockPresent.Store(true)
+	dm.pollOnce()
+	if attempts.Load() != 0 {
+		t.Fatalf("expected 0 polls when pinned device is healthy, got %d", attempts.Load())
+	}
+
+	// Dock unplugged -> Stop callback marks dirty; poll while absent does nothing.
+	dockPresent.Store(false)
+	dm.markDirty()
+	dm.pollOnce()
+	if attempts.Load() != 0 {
+		t.Fatalf("expected 0 reopens while dock absent, got %d", attempts.Load())
+	}
+
+	// Dock reattached -> pollOnce reopens pinned device and clears dirty.
+	dockPresent.Store(true)
+	dm.pollOnce()
+	if attempts.Load() != 1 {
+		t.Fatalf("expected 1 reopen once pinned dock device returned, got %d", attempts.Load())
+	}
+
+	// Subsequent poll after recovery stays idle.
+	dm.pollOnce()
+	if attempts.Load() != 1 {
+		t.Fatalf("expected no duplicate reopen after recovery, got %d", attempts.Load())
+	}
+}
+
 func TestDeviceMonitorCloseCancelsMidDebounce(t *testing.T) {
 	devA := fakeDeviceInfo('A')
 	devB := fakeDeviceInfo('B')
@@ -200,7 +296,7 @@ func TestDeviceMonitorCloseCancelsMidDebounce(t *testing.T) {
 	var changes atomic.Int32
 
 	dm := newDeviceMonitorWith(
-		func() (*malgo.DeviceInfo, error) {
+		func(_ string) (*malgo.DeviceInfo, error) {
 			select {
 			case enteredPoll <- struct{}{}:
 			default:
@@ -240,7 +336,7 @@ func TestDeviceMonitorSetFilterDuringDebounceSuppressesChange(t *testing.T) {
 
 	var changes atomic.Int32
 	dm := &DeviceMonitor{
-		pollFn: func() (*malgo.DeviceInfo, error) {
+		pollFn: func(_ string) (*malgo.DeviceInfo, error) {
 			return devB, nil
 		},
 		debounce: 40 * time.Millisecond,

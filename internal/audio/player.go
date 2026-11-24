@@ -87,6 +87,7 @@ type Player struct {
 	ring           *byteRingBuffer
 	volumeBits     atomic.Uint64
 	lastWriteBytes atomic.Int64
+	stopping       atomic.Bool
 	started        bool
 	closed         bool
 	config         Config
@@ -170,13 +171,14 @@ func (p *Player) SetVolume(v float64) {
 
 // openAndStartDevice initializes and starts the playback device on the pinned
 // audio context thread. Caller must not hold p.mu around this call.
-func (p *Player) openAndStartDevice() (*malgo.Device, malgo.DeviceID, error) {
+func (p *Player) openAndStartDevice() (*malgo.Device, malgo.DeviceID, bool, error) {
 	var (
-		dev   *malgo.Device
-		devID malgo.DeviceID
+		dev     *malgo.Device
+		devID   malgo.DeviceID
+		matched bool
 	)
 	err := p.ctx.do(func(ctx malgo.Context) error {
-		info, err := playbackDevice(ctx, p.config.Device)
+		info, m, err := playbackDeviceMatch(ctx, p.config.Device)
 		if err != nil {
 			return err
 		}
@@ -204,32 +206,57 @@ func (p *Player) openAndStartDevice() (*malgo.Device, malgo.DeviceID, error) {
 		dc.SampleRate = uint32(p.config.SampleRate)
 		dc.PeriodSizeInMilliseconds = uint32(periodMs)
 		dc.Alsa.NoMMap = 1
+		// Disable miniaudio's internal WASAPI IMMNotificationClient auto-reroute:
+		// it can AB-BA deadlock with Device.Uninit() during USB dock unplug/replug.
+		// DeviceMonitor + Stop callback handle device switching and reconnects cleanly.
+		dc.Wasapi.NoAutoStreamRouting = 1
 
-		// Pin to a specific device only when one was explicitly requested; otherwise
-		// use the default device (which the monitor then follows).
-		if p.config.Device != "" {
+		// Pin to a specific device only when one was explicitly requested and present;
+		// otherwise open the default device (which the monitor then follows).
+		if p.config.Device != "" && m {
 			dc.Playback.DeviceID = info.ID.Pointer()
 		}
 
-		d, err := malgo.InitDevice(ctx, dc, malgo.DeviceCallbacks{Data: p.onData})
+		d, err := malgo.InitDevice(ctx, dc, malgo.DeviceCallbacks{
+			Data: p.onData,
+			Stop: p.onDeviceStopped,
+		})
 		if err != nil {
 			return fmt.Errorf("could not init playback device: %w", err)
 		}
 		if err := d.Start(); err != nil {
+			p.stopping.Store(true)
 			d.Uninit()
+			p.stopping.Store(false)
 			return err
 		}
 		dev = d
 		devID = info.ID
+		matched = m
 		return nil
 	})
-	return dev, devID, err
+	return dev, devID, matched, err
+}
+
+// onDeviceStopped is invoked by miniaudio if the OS invalidates/unplugs the
+// active audio endpoint (e.g., USB-C dock switched away). Must never lock
+// opMu or call into malgo synchronously because miniaudio holds its device lock.
+func (p *Player) onDeviceStopped() {
+	if p.stopping.Load() {
+		return
+	}
+	log.Println("Playback device stopped unexpectedly (device disconnected?), scheduling reopen...")
+	if p.monitor != nil {
+		p.monitor.markDirty()
+	}
 }
 
 func (p *Player) stopDevice(dev *malgo.Device) {
 	if dev == nil {
 		return
 	}
+	p.stopping.Store(true)
+	defer p.stopping.Store(false)
 	_ = p.ctx.do(func(_ malgo.Context) error {
 		_ = dev.Stop()
 		dev.Uninit()
@@ -250,12 +277,17 @@ func (p *Player) Start() error {
 
 	p.pb.reset()
 
-	dev, devID, err := p.openAndStartDevice()
+	dev, devID, matched, err := p.openAndStartDevice()
 	if err != nil {
 		return err
 	}
 	if p.monitor != nil {
 		p.monitor.setCurrent(devID.String())
+		if !matched {
+			// Preferred pinned device wasn't attached (e.g. dock unplugged);
+			// keep watching so we switch to it as soon as it reappears.
+			p.monitor.markDirty()
+		}
 	}
 
 	p.mu.Lock()
@@ -704,7 +736,7 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) bool {
 	p.ring.Reset()
 	p.pb.reset()
 
-	dev, _, err := p.openAndStartDevice()
+	dev, _, matched, err := p.openAndStartDevice()
 	if err != nil {
 		log.Printf("Error reopening device after change: %v", err)
 		return false
@@ -713,7 +745,7 @@ func (p *Player) followDefault(info *malgo.DeviceInfo) bool {
 	p.mu.Lock()
 	p.device = dev
 	p.mu.Unlock()
-	return true
+	return matched
 }
 
 func (p *Player) Stop() {

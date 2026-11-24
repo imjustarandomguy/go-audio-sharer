@@ -32,6 +32,7 @@ type Recorder struct {
 	monitor     *DeviceMonitor
 	opMu        sync.Mutex
 	mu          sync.Mutex
+	stopping    atomic.Bool
 	isRecording bool
 	closed      bool
 	captureID   malgo.DeviceID
@@ -182,14 +183,19 @@ func (r *Recorder) startRecordingLocked() bool {
 		dc.Alsa.NoMMap = 1
 		dc.Capture.DeviceID = info.ID.Pointer()
 
-		s, err := malgo.InitDevice(ctx, dc, malgo.DeviceCallbacks{Data: r.onData})
+		s, err := malgo.InitDevice(ctx, dc, malgo.DeviceCallbacks{
+			Data: r.onData,
+			Stop: r.onDeviceStopped,
+		})
 		if err != nil {
 			log.Printf("Error creating loopback capture: %v", err)
 			return err
 		}
 		if err := s.Start(); err != nil {
 			log.Printf("Error starting loopback capture: %v", err)
+			r.stopping.Store(true)
 			s.Uninit()
+			r.stopping.Store(false)
 			return err
 		}
 		playID = play.ID.String()
@@ -250,6 +256,16 @@ func (r *Recorder) onData(_, in []byte, framecount uint32) {
 	r.broadcaster.Broadcast(r.allocBlock(in))
 }
 
+func (r *Recorder) onDeviceStopped() {
+	if r.stopping.Load() {
+		return
+	}
+	log.Println("Capture device stopped unexpectedly (device disconnected?), scheduling reopen...")
+	if r.monitor != nil {
+		r.monitor.markDirty()
+	}
+}
+
 func (r *Recorder) stopRecording() {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
@@ -264,11 +280,13 @@ func (r *Recorder) stopRecordingLocked() {
 	r.mu.Unlock()
 
 	if stream != nil {
+		r.stopping.Store(true)
 		_ = r.client.do(func(_ malgo.Context) error {
 			_ = stream.Stop()
 			stream.Uninit()
 			return nil
 		})
+		r.stopping.Store(false)
 		r.lastCaptureNs.Store(0)
 		log.Println("Stopped loopback capture")
 	}

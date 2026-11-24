@@ -12,8 +12,9 @@ import (
 )
 
 const (
-	devicePollInterval = 5 * time.Second
-	deviceDebounce     = 250 * time.Millisecond
+	devicePollInterval  = 5 * time.Second
+	deviceRetryInterval = 2 * time.Second
+	deviceDebounce      = 250 * time.Millisecond
 )
 
 var (
@@ -126,28 +127,51 @@ func (l *lockedAudioContext) close() {
 }
 
 // playbackDevice selects the playback device to use: a substring match against
-// filter when set, otherwise the system default device.
+// filter when set, otherwise the system default device. Falls back to the
+// default device if filter is currently unplugged.
 func playbackDevice(ctx malgo.Context, filter string) (*malgo.DeviceInfo, error) {
+	info, _, err := playbackDeviceMatch(ctx, filter)
+	return info, err
+}
+
+// playbackDeviceMatch returns the selected playback device and reports whether
+// it strictly satisfied filter (always true when filter is empty).
+func playbackDeviceMatch(ctx malgo.Context, filter string) (*malgo.DeviceInfo, bool, error) {
 	devs, err := ctx.Devices(malgo.Playback)
 	if err != nil {
-		return nil, fmt.Errorf("could not enumerate audio devices: %w", err)
+		return nil, false, fmt.Errorf("could not enumerate audio devices: %w", err)
 	}
 	if filter != "" {
+		lf := strings.ToLower(filter)
 		for i := range devs {
-			if strings.Contains(strings.ToLower(devs[i].Name()), strings.ToLower(filter)) {
-				return &devs[i], nil
+			if strings.Contains(strings.ToLower(devs[i].Name()), lf) {
+				return &devs[i], true, nil
 			}
 		}
 	}
 	for i := range devs {
 		if devs[i].IsDefault != 0 {
-			return &devs[i], nil
+			return &devs[i], filter == "", nil
 		}
 	}
 	if len(devs) > 0 {
-		return &devs[0], nil
+		return &devs[0], filter == "", nil
 	}
-	return nil, errNoPlaybackDevice
+	return nil, false, errNoPlaybackDevice
+}
+
+// findPlaybackDeviceStrict finds the playback device matching filter without
+// falling back to another device when filter is non-empty. When filter is empty
+// it returns the current system default playback device.
+func findPlaybackDeviceStrict(ctx malgo.Context, filter string) (*malgo.DeviceInfo, error) {
+	info, matched, err := playbackDeviceMatch(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	if filter != "" && !matched {
+		return nil, errNoPlaybackDevice
+	}
+	return info, nil
 }
 
 // listPlaybackDevices returns all playback devices for UI display.
@@ -244,11 +268,11 @@ func ListPlaybackDeviceDescriptions() ([]DeviceDesc, error) {
 	return desc, err
 }
 
-func defaultPlaybackDeviceFromDiscovery(key string, backends []malgo.Backend) (*malgo.DeviceInfo, error) {
+func playbackDeviceFromDiscovery(key string, backends []malgo.Backend, filter string) (*malgo.DeviceInfo, error) {
 	var info *malgo.DeviceInfo
 	err := withDiscoveryContext(key, backends, func(ctx malgo.Context) error {
 		var err error
-		info, err = playbackDevice(ctx, "")
+		info, err = findPlaybackDeviceStrict(ctx, filter)
 		return err
 	})
 	return info, err
@@ -297,22 +321,24 @@ func loopbackCaptureDevice(ctx malgo.Context, filter string) (*malgo.DeviceInfo,
 	return nil, fmt.Errorf("no monitor capture device found for %q", play.Name())
 }
 
-// DeviceMonitor watches for the default playback device changing so the audio
-// device can be re-created to follow it. Only meaningful when no specific
-// device filter was chosen.
+// DeviceMonitor watches for the default playback device changing (when filter
+// is empty) or a disconnected/unplugged device reappearing (for both default
+// and pinned devices, such as a USB-C dock being unplugged and reattached).
 //
 // Device enumeration runs against the isolated discovery context rather than
 // the live streaming context so polling never contends with real-time audio.
 type DeviceMonitor struct {
-	pollFn   func() (*malgo.DeviceInfo, error)
-	interval time.Duration
-	debounce time.Duration
+	pollFn        func(filter string) (*malgo.DeviceInfo, error)
+	interval      time.Duration
+	retryInterval time.Duration
+	debounce      time.Duration
 
 	filter   string
 	mu       sync.Mutex
 	current  string
-	dirty    bool // true when last onChange failed and must retry even if OS reverts to current
+	dirty    bool // true when device stopped unexpectedly or reopen failed; forces retry
 	onChange func(info *malgo.DeviceInfo) bool
+	wakeCh   chan struct{}
 	stopCh   chan struct{}
 	done     chan struct{}
 	once     sync.Once
@@ -323,41 +349,77 @@ func newDeviceMonitor(filter string, onChange func(*malgo.DeviceInfo) bool) *Dev
 }
 
 func newDeviceMonitorForBackends(key string, backends []malgo.Backend, filter string, onChange func(*malgo.DeviceInfo) bool) *DeviceMonitor {
-	pollFn := func() (*malgo.DeviceInfo, error) {
-		return defaultPlaybackDeviceFromDiscovery(key, backends)
+	pollFn := func(f string) (*malgo.DeviceInfo, error) {
+		return playbackDeviceFromDiscovery(key, backends, f)
 	}
 	return newDeviceMonitorWith(pollFn, devicePollInterval, deviceDebounce, filter, onChange)
 }
 
 func newDeviceMonitorWith(
-	pollFn func() (*malgo.DeviceInfo, error),
+	pollFn func(filter string) (*malgo.DeviceInfo, error),
 	interval, debounce time.Duration,
 	filter string,
 	onChange func(*malgo.DeviceInfo) bool,
 ) *DeviceMonitor {
+	retry := deviceRetryInterval
+	if interval > 0 && interval < retry {
+		retry = interval
+	}
 	dm := &DeviceMonitor{
-		pollFn:   pollFn,
-		interval: interval,
-		debounce: debounce,
-		filter:   filter,
-		onChange: onChange,
-		stopCh:   make(chan struct{}),
-		done:     make(chan struct{}),
+		pollFn:        pollFn,
+		interval:      interval,
+		retryInterval: retry,
+		debounce:      debounce,
+		filter:        filter,
+		onChange:      onChange,
+		wakeCh:        make(chan struct{}, 1),
+		stopCh:        make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 	go dm.run()
 	return dm
 }
 
+func (dm *DeviceMonitor) nextDelay() time.Duration {
+	dm.mu.Lock()
+	dirty := dm.dirty
+	dm.mu.Unlock()
+	if dirty && dm.retryInterval > 0 {
+		return dm.retryInterval
+	}
+	return dm.interval
+}
+
 func (dm *DeviceMonitor) run() {
 	defer close(dm.done)
-	t := time.NewTicker(dm.interval)
-	defer t.Stop()
+	timer := time.NewTimer(dm.nextDelay())
+	defer timer.Stop()
 	for {
 		select {
 		case <-dm.stopCh:
 			return
-		case <-t.C:
+		case <-dm.wakeCh:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			// Give the OS a brief moment to settle endpoint removal/addition.
+			if dm.debounce > 0 {
+				settle := time.NewTimer(dm.debounce)
+				select {
+				case <-dm.stopCh:
+					settle.Stop()
+					return
+				case <-settle.C:
+				}
+			}
 			dm.pollOnce()
+			timer.Reset(dm.nextDelay())
+		case <-timer.C:
+			dm.pollOnce()
+			timer.Reset(dm.nextDelay())
 		}
 	}
 }
@@ -365,19 +427,25 @@ func (dm *DeviceMonitor) run() {
 func (dm *DeviceMonitor) pollOnce() {
 	dm.mu.Lock()
 	filter := dm.filter
+	dirty := dm.dirty
 	dm.mu.Unlock()
-	if filter != "" || dm.pollFn == nil {
+	if dm.pollFn == nil {
+		return
+	}
+	// When pinned to a specific device, only poll when dirty (e.g. unplugged
+	// dock device needs to be reopened once it reappears).
+	if filter != "" && !dirty {
 		return
 	}
 
-	info, err := dm.pollFn()
+	info, err := dm.pollFn(filter)
 	if err != nil || info == nil {
 		return
 	}
 	id := info.ID.String()
 
 	dm.mu.Lock()
-	if dm.filter != "" {
+	if dm.filter != filter {
 		dm.mu.Unlock()
 		return
 	}
@@ -402,7 +470,7 @@ func (dm *DeviceMonitor) pollOnce() {
 			return
 		case <-timer.C:
 		}
-		info2, err := dm.pollFn()
+		info2, err := dm.pollFn(filter)
 		if err != nil || info2 == nil {
 			return
 		}
@@ -421,7 +489,7 @@ func (dm *DeviceMonitor) pollOnce() {
 	}
 
 	dm.mu.Lock()
-	changed := dm.filter == "" && (dm.dirty || (dm.current != "" && id != dm.current))
+	changed := dm.filter == filter && (dm.dirty || (filter == "" && dm.current != "" && id != dm.current))
 	dm.mu.Unlock()
 
 	if !changed {
@@ -430,13 +498,14 @@ func (dm *DeviceMonitor) pollOnce() {
 
 	// Only commit dm.current and clear dirty after onChange reports success,
 	// so transient reopen failures automatically retry on the next poll—even
-	// if the OS falls back to the previous default device.
+	// if the OS falls back to the previous default device or reuses the same
+	// USB audio endpoint GUID after a dock replug.
 	applied := true
 	if dm.onChange != nil {
 		applied = dm.onChange(info)
 	}
 	dm.mu.Lock()
-	if dm.filter == "" {
+	if dm.filter == filter {
 		if applied {
 			dm.current = id
 			dm.dirty = false
@@ -447,8 +516,22 @@ func (dm *DeviceMonitor) pollOnce() {
 	dm.mu.Unlock()
 }
 
+// markDirty marks the active device as needing reopen (e.g. after an unexpected
+// OS unplug/Stop callback) and wakes the monitor immediately.
+func (dm *DeviceMonitor) markDirty() {
+	dm.mu.Lock()
+	dm.dirty = true
+	dm.mu.Unlock()
+	if dm.wakeCh != nil {
+		select {
+		case dm.wakeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // setFilter updates the device filter. When empty, the monitor follows default
-// device changes; when non-empty, default-device polling is paused.
+// device changes; when non-empty, polling stays idle unless markDirty is set.
 func (dm *DeviceMonitor) setFilter(filter string) {
 	dm.mu.Lock()
 	dm.filter = filter
